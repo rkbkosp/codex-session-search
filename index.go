@@ -24,6 +24,7 @@ type indexManager struct {
 	StdoutLogPath   string
 	StderrLogPath   string
 	LaunchAgentPath string
+	SystemdUnitPath string
 	Label           string
 }
 
@@ -73,6 +74,7 @@ func newIndexManager(root string) (indexManager, error) {
 		StdoutLogPath:   filepath.Join(storageDir, "daemon.stdout.log"),
 		StderrLogPath:   filepath.Join(storageDir, "daemon.stderr.log"),
 		LaunchAgentPath: filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
+		SystemdUnitPath: filepath.Join(home, ".config", "systemd", "user", label+".service"),
 		Label:           label,
 	}, nil
 }
@@ -81,8 +83,10 @@ func ensureIndexDirs(manager indexManager) error {
 	if err := os.MkdirAll(manager.SessionsDir, 0o755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(manager.LaunchAgentPath), 0o755); err != nil {
-		return err
+	if path := daemonConfigPath(manager); path != "" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -14,7 +14,7 @@ It supports:
 - Relative time filters (`--last 3d`, `--last 3h`, `--last 90min`, `--last 3mon`)
 - Assistant-only or user-only search
 - Persistent lightweight index
-- Continuous background refresh on macOS via LaunchAgent
+- Continuous background refresh on macOS via LaunchAgent or on Linux via `systemd --user`
 
 The tool defaults to `~/.codex` as Codex home and searches `~/.codex/sessions`.
 
@@ -33,7 +33,7 @@ On the current machine, raw sessions are about `1.3G`, while the extracted index
 
 - Go 1.22+
 - Codex session data under `~/.codex`
-- macOS if you want the built-in background daemon management
+- macOS with `launchctl`, or Linux with `systemd --user`, if you want built-in background daemon management
 
 Search itself is plain Go and does not require third-party dependencies.
 
@@ -53,7 +53,7 @@ File roles:
 
 - `main.go`: CLI parsing, raw search fallback, text/json output
 - `index.go`: lightweight index storage, incremental refresh, indexed search
-- `daemon.go`: index/daemon subcommands, macOS LaunchAgent management
+- `daemon.go`: index/daemon subcommands, macOS LaunchAgent and Linux systemd user-service management
 
 ## Build
 
@@ -228,7 +228,8 @@ It does not duplicate:
 
 The daemon continuously refreshes the lightweight index in the background.
 
-On macOS it is managed as a LaunchAgent.
+- On macOS it is managed as a LaunchAgent
+- On Linux, including Ubuntu, it is managed as a `systemd --user` service
 
 ### Install And Start
 
@@ -239,8 +240,8 @@ codex-session-search daemon install --interval 15s
 This does three things:
 
 1. Performs an initial index refresh
-2. Writes a LaunchAgent plist under `~/Library/LaunchAgents`
-3. Registers and starts the service with `launchctl`
+2. Writes a service definition for the current platform
+3. Registers and starts the service with `launchctl` on macOS or `systemctl --user` on Linux
 
 ### Status
 
@@ -305,13 +306,14 @@ Meaning:
 - `daemon.stderr.log`: daemon stderr log
 - `sessions/*.jsonl`: extracted lightweight per-session message logs
 
-The LaunchAgent plist path is:
+The service file path depends on platform:
 
 ```text
-~/Library/LaunchAgents/cn.rkbkosp.codex-session-search.<hash>.plist
+macOS: ~/Library/LaunchAgents/<label>.plist
+Linux: ~/.config/systemd/user/<label>.service
 ```
 
-The `<hash>` is derived from the configured Codex root path, so different roots get isolated runtime directories and service labels.
+The `<label>` includes a hash derived from the configured Codex root path, so different roots get isolated runtime directories and service labels.
 
 ## Performance Notes
 
@@ -341,7 +343,7 @@ If needed, force a rebuild:
 codex-session-search index refresh
 ```
 
-### LaunchAgent Is Installed But Not Running
+### Daemon Is Installed But Not Running
 
 Check status:
 
@@ -356,11 +358,28 @@ tail -n 100 ~/.local/share/codex-session-search/runtime/<hash>/daemon.stderr.log
 tail -n 100 ~/.local/share/codex-session-search/runtime/<hash>/daemon.stdout.log
 ```
 
+On Linux you can also inspect the user service directly:
+
+```bash
+systemctl --user status <label>.service
+journalctl --user -u <label>.service -n 100
+```
+
 Try reinstalling:
 
 ```bash
 codex-session-search daemon uninstall
 codex-session-search daemon install --interval 15s
+```
+
+### `systemctl --user` Cannot Connect To Bus
+
+On Linux, the daemon uses the per-user systemd manager.
+
+If you see an error about failing to connect to the user bus, make sure the account has an active user session, or enable lingering:
+
+```bash
+loginctl enable-linger "$USER"
 ```
 
 ### `--last` Does Not Combine With `--from`
@@ -390,7 +409,7 @@ codex-session-search --limit 0 "query"
 
 ## Development Notes
 
-- The daemon is macOS-specific because it integrates with `launchctl`
+- The daemon integrates with `launchctl` on macOS and `systemctl --user` on Linux
 - The index format is designed to be disposable; you can delete the runtime directory and rebuild it
 - The raw search path still exists as a fallback implementation
 - The project currently uses only the Go standard library
