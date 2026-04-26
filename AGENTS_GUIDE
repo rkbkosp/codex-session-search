@@ -1,0 +1,182 @@
+# Agent Installation Guide
+
+This guide is for AI coding agents installing `github.com/rkbkosp/codex-session-search` for a user.
+
+`codex-session-search` is a Go CLI for searching local Codex session history under `~/.codex/sessions`.
+
+## Important Notes For Agents
+
+- This repository is **not** a Codex skill. It does not contain `SKILL.md`.
+- Do **not** install it with Codex skill installers.
+- Install it as a Go CLI binary.
+- The current `go.mod` declares `module codex-session-search`, so avoid `go install
+github.com/rkbkosp/codex-session-search@latest` unless the module path is changed in the future.
+- Prefer installing the binary to `~/.local/bin/codex-session-search`.
+- Do not enable the background daemon unless the user explicitly wants automatic indexing.
+
+## Requirements
+
+Before installing, verify:
+
+```bash
+go version
+
+The project requires Go 1.22 or newer.
+
+The user should have Codex session data under:
+
+~/.codex/sessions
+
+## Install From GitHub
+
+Use a temporary clone, then build the binary into the user-local bin directory.
+
+tmpdir="$(mktemp -d)"
+git clone --depth 1 https://github.com/rkbkosp/codex-session-search.git "$tmpdir/codex-session-search"
+
+mkdir -p "$HOME/.local/bin"
+
+cd "$tmpdir/codex-session-search"
+go build -trimpath -ldflags="-s -w" -o "$HOME/.local/bin/codex-session-search" .
+
+Verify the binary:
+
+"$HOME/.local/bin/codex-session-search" --help
+
+If ~/.local/bin is already on PATH, this should also work:
+
+codex-session-search --help
+
+## PATH Check
+
+Check whether the command is available directly:
+
+which codex-session-search
+
+If it is not found, tell the user to add this to their shell config:
+
+export PATH="$HOME/.local/bin:$PATH"
+
+For zsh, that usually means adding it to:
+
+~/.zshrc
+
+Then reload the shell:
+
+source ~/.zshrc
+
+## Initial Index Refresh
+
+After installation, refresh the index once:
+
+codex-session-search index refresh
+
+Then verify status:
+
+codex-session-search index status
+
+Expected output should show:
+
+Indexed sessions: <number>
+Updated at: <timestamp>
+
+## Test Search
+
+Run a small query to confirm search works:
+
+codex-session-search --limit 1 codex
+
+If there are matching sessions, output should include a result and a resume command like:
+
+resume codex resume <session-id>
+
+## Optional: Background Daemon
+
+Only install the daemon if the user wants the index to stay fresh automatically.
+
+codex-session-search daemon install --interval 15s
+
+Check daemon status:
+
+codex-session-search daemon status
+
+Stop daemon:
+
+codex-session-search daemon stop
+
+Uninstall daemon:
+
+codex-session-search daemon uninstall
+
+## Common Commands
+
+Search all indexed sessions:
+
+codex-session-search "query"
+
+Search recent sessions:
+
+codex-session-search --last 3d "query"
+
+Search assistant messages only:
+
+codex-session-search --assistant-only "query"
+
+Search user messages only:
+
+codex-session-search --user-only "query"
+
+Show expanded output:
+
+codex-session-search --view full --limit 5 "query"
+
+Emit JSON:
+
+codex-session-search --json --limit 20 "query"
+
+## Troubleshooting
+
+### SKILL.md not found
+
+This means the agent tried to install the repository as a Codex skill. That is incorrect.
+
+Install it as a Go CLI instead.
+
+### codex-session-search: command not found
+
+Use the absolute path first:
+
+"$HOME/.local/bin/codex-session-search" --help
+
+Then ensure ~/.local/bin is on PATH.
+
+### No indexed sessions
+
+Run:
+
+codex-session-search index refresh
+
+Then check:
+
+codex-session-search index status
+
+### Search is slow
+
+Confirm the index exists:
+
+codex-session-search index status
+
+If needed, rebuild it:
+
+codex-session-search index refresh
+
+For large histories, ask the user whether they want the daemon installed.
+
+## Recommended Agent Completion Message
+
+After a successful install, summarize:
+
+Installed codex-session-search to ~/.local/bin/codex-session-search.
+Verified the CLI with --help.
+Refreshed the index and indexed N sessions.
+You can search with: codex-session-search "query".
