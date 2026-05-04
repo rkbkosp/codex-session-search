@@ -9,16 +9,24 @@ import (
 	"hash/fnv"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 	"time"
 )
 
-const indexVersion = 1
+const indexVersion = 2
+
+var (
+	wholeCommitHashPattern   = regexp.MustCompile(`(?i)^[0-9a-f]{4,40}$`)
+	leadingCommitHashPattern = regexp.MustCompile(`(?i)^([0-9a-f]{4,40})(?:\s|$)`)
+)
 
 type indexManager struct {
 	Root            string
 	StorageDir      string
 	SessionsDir     string
+	CommitsDir      string
 	StatePath       string
 	StatusPath      string
 	StdoutLogPath   string
@@ -46,11 +54,14 @@ type indexedSessionMeta struct {
 	Size            int64  `json:"size"`
 	ModTimeUnixNano int64  `json:"mod_time_unix_nano"`
 	IndexFile       string `json:"index_file"`
+	CommitIndexFile string `json:"commit_index_file,omitempty"`
 	MessageCount    int    `json:"message_count"`
+	CommitCount     int    `json:"commit_count,omitempty"`
 }
 
 type refreshResult struct {
 	IndexedSessions   int       `json:"indexed_sessions"`
+	IndexedCommitRefs int       `json:"indexed_commit_refs"`
 	ChangedSessions   int       `json:"changed_sessions"`
 	DeletedSessions   int       `json:"deleted_sessions"`
 	UnchangedSessions int       `json:"unchanged_sessions"`
@@ -69,6 +80,7 @@ func newIndexManager(root string) (indexManager, error) {
 		Root:            root,
 		StorageDir:      storageDir,
 		SessionsDir:     filepath.Join(storageDir, "sessions"),
+		CommitsDir:      filepath.Join(storageDir, "commits"),
 		StatePath:       filepath.Join(storageDir, "state.json"),
 		StatusPath:      filepath.Join(storageDir, "daemon-status.json"),
 		StdoutLogPath:   filepath.Join(storageDir, "daemon.stdout.log"),
@@ -81,6 +93,9 @@ func newIndexManager(root string) (indexManager, error) {
 
 func ensureIndexDirs(manager indexManager) error {
 	if err := os.MkdirAll(manager.SessionsDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(manager.CommitsDir, 0o755); err != nil {
 		return err
 	}
 	if path := daemonConfigPath(manager); path != "" {
@@ -160,12 +175,14 @@ func refreshIndex(manager indexManager) (refreshResult, error) {
 			prev.Size == info.Size() &&
 			prev.ModTimeUnixNano == info.ModTime().UnixNano() &&
 			prev.IndexFile != "" &&
+			prev.CommitIndexFile != "" &&
+			fileExists(filepath.Join(manager.StorageDir, prev.CommitIndexFile)) &&
 			fileExists(filepath.Join(manager.StorageDir, prev.IndexFile)) {
 			result.UnchangedSessions++
 			continue
 		}
 
-		meta, messages, err := extractIndexedSession(file, threadIndex)
+		meta, messages, commitRefs, err := extractIndexedSession(file, threadIndex)
 		if err != nil {
 			return refreshResult{}, fmt.Errorf("%s: %w", file.Path, err)
 		}
@@ -173,9 +190,14 @@ func refreshIndex(manager indexManager) (refreshResult, error) {
 		meta.Size = info.Size()
 		meta.ModTimeUnixNano = info.ModTime().UnixNano()
 		meta.IndexFile = filepath.Join("sessions", indexFileName(file.Path))
+		meta.CommitIndexFile = filepath.Join("commits", indexFileName(file.Path))
 
 		indexPath := filepath.Join(manager.StorageDir, meta.IndexFile)
 		if err := writeIndexedMessages(indexPath, messages); err != nil {
+			return refreshResult{}, err
+		}
+		commitIndexPath := filepath.Join(manager.StorageDir, meta.CommitIndexFile)
+		if err := writeIndexedCommits(commitIndexPath, commitRefs); err != nil {
 			return refreshResult{}, err
 		}
 
@@ -190,11 +212,15 @@ func refreshIndex(manager indexManager) (refreshResult, error) {
 		if meta.IndexFile != "" {
 			_ = os.Remove(filepath.Join(manager.StorageDir, meta.IndexFile))
 		}
+		if meta.CommitIndexFile != "" {
+			_ = os.Remove(filepath.Join(manager.StorageDir, meta.CommitIndexFile))
+		}
 		delete(state.Sessions, sourcePath)
 		result.DeletedSessions++
 	}
 
 	result.IndexedSessions = len(state.Sessions)
+	result.IndexedCommitRefs = countIndexedCommitRefs(state)
 	result.UpdatedAt = time.Now()
 	state.UpdatedAt = result.UpdatedAt.Format(time.RFC3339)
 	if err := saveIndexState(manager, state); err != nil {
@@ -203,7 +229,7 @@ func refreshIndex(manager indexManager) (refreshResult, error) {
 	return result, nil
 }
 
-func extractIndexedSession(file sessionFile, threadIndex map[string]indexEntry) (indexedSessionMeta, []message, error) {
+func extractIndexedSession(file sessionFile, threadIndex map[string]indexEntry) (indexedSessionMeta, []message, []commitMatch, error) {
 	id := extractSessionID(file.Path)
 	meta := indexedSessionMeta{
 		SourcePath: file.Path,
@@ -220,11 +246,13 @@ func extractIndexedSession(file sessionFile, threadIndex map[string]indexEntry) 
 
 	handle, err := os.Open(file.Path)
 	if err != nil {
-		return indexedSessionMeta{}, nil, err
+		return indexedSessionMeta{}, nil, nil, err
 	}
 	defer handle.Close()
 
 	var messages []message
+	var commitRefs []commitMatch
+	pendingCommitCalls := make(map[string]commitCommandContext)
 	scanner := bufio.NewScanner(handle)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxScannerLineBytes)
 	for scanner.Scan() {
@@ -257,21 +285,33 @@ func extractIndexedSession(file sessionFile, threadIndex map[string]indexEntry) 
 			}
 		case "response_item":
 			msg := extractMessage(env.Timestamp, env.Payload)
-			if msg == nil || !searchableRole(msg.Role, "all") {
+			if msg != nil && searchableRole(msg.Role, "all") {
+				messages = append(messages, *msg)
+			}
+			if ctx, ok := extractCommitCommandContext(env.Timestamp, env.Payload); ok {
+				pendingCommitCalls[ctx.CallID] = ctx
 				continue
 			}
-			messages = append(messages, *msg)
+			if refs := extractCommitRefsFromFunctionCallOutput(env.Timestamp, env.Payload, pendingCommitCalls); len(refs) > 0 {
+				commitRefs = append(commitRefs, refs...)
+			}
+		case "event_msg":
+			if refs := extractCommitRefsFromExecCommandEnd(env.Timestamp, env.Payload); len(refs) > 0 {
+				commitRefs = append(commitRefs, refs...)
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return indexedSessionMeta{}, nil, err
+		return indexedSessionMeta{}, nil, nil, err
 	}
 
 	meta.MessageCount = len(messages)
+	commitRefs = dedupeCommitMatches(commitRefs)
+	meta.CommitCount = len(commitRefs)
 	if meta.Title == "" && len(messages) > 0 {
 		meta.Title = fallbackTitle([]string{messages[0].Text})
 	}
-	return meta, messages, nil
+	return meta, messages, commitRefs, nil
 }
 
 func writeIndexedMessages(path string, messages []message) error {
@@ -279,6 +319,17 @@ func writeIndexedMessages(path string, messages []message) error {
 	enc := json.NewEncoder(&buf)
 	for _, msg := range messages {
 		if err := enc.Encode(msg); err != nil {
+			return err
+		}
+	}
+	return writeFileAtomic(path, buf.Bytes(), 0o644)
+}
+
+func writeIndexedCommits(path string, matches []commitMatch) error {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, match := range matches {
+		if err := enc.Encode(match); err != nil {
 			return err
 		}
 	}
@@ -305,6 +356,37 @@ func searchWithIndex(manager indexManager, cfg config) ([]result, []string, int,
 	var warnings []string
 	for _, meta := range candidates {
 		res, err := searchIndexedSession(manager, meta, cfg)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("%s: %v", meta.SourcePath, err))
+			continue
+		}
+		if res != nil {
+			results = append(results, *res)
+		}
+	}
+	return results, warnings, len(candidates), nil
+}
+
+func searchCommitsWithIndex(manager indexManager, cfg config) ([]result, []string, int, error) {
+	state, err := loadIndexState(manager)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	if len(state.Sessions) == 0 || !commitIndexReady(manager, state) {
+		if _, err := refreshIndex(manager); err != nil {
+			return nil, nil, 0, err
+		}
+		state, err = loadIndexState(manager)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+	}
+
+	candidates := filterIndexedSessions(state, cfg)
+	results := make([]result, 0, len(candidates))
+	var warnings []string
+	for _, meta := range candidates {
+		res, err := searchIndexedSessionCommits(manager, meta, cfg)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("%s: %v", meta.SourcePath, err))
 			continue
@@ -422,6 +504,302 @@ func searchIndexedSession(manager indexManager, meta indexedSessionMeta, cfg con
 		return nil, nil
 	}
 	return res, nil
+}
+
+func searchIndexedSessionCommits(manager indexManager, meta indexedSessionMeta, cfg config) (*result, error) {
+	if meta.CommitIndexFile == "" {
+		return nil, nil
+	}
+	indexPath := filepath.Join(manager.StorageDir, meta.CommitIndexFile)
+	handle, err := os.Open(indexPath)
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
+
+	res := &result{
+		ID:        meta.SessionID,
+		Title:     meta.Title,
+		UpdatedAt: meta.UpdatedAt,
+		Date:      meta.Date,
+		StartedAt: meta.StartedAt,
+		CWD:       meta.CWD,
+		Path:      meta.SourcePath,
+		Resume:    "codex resume " + meta.SessionID,
+	}
+
+	scanner := bufio.NewScanner(handle)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxScannerLineBytes)
+	for scanner.Scan() {
+		var match commitMatch
+		if err := json.Unmarshal(scanner.Bytes(), &match); err != nil {
+			continue
+		}
+		if !commitMatchHasQuery(match, cfg.CommitQuery) {
+			continue
+		}
+		res.CommitMatched = true
+		res.MatchCount++
+		res.CommitMatches = append(res.CommitMatches, match)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if !res.CommitMatched {
+		return nil, nil
+	}
+	return res, nil
+}
+
+type commitCommandContext struct {
+	CallID    string
+	Timestamp string
+	Command   string
+	CWD       string
+}
+
+type toolFunctionCall struct {
+	Type      string          `json:"type"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+	CallID    string          `json:"call_id"`
+}
+
+type toolFunctionCallOutput struct {
+	Type   string `json:"type"`
+	CallID string `json:"call_id"`
+	Output string `json:"output"`
+}
+
+type execCommandArguments struct {
+	Cmd     string `json:"cmd"`
+	Workdir string `json:"workdir"`
+}
+
+type execCommandEndPayload struct {
+	Type             string   `json:"type"`
+	CallID           string   `json:"call_id"`
+	Command          []string `json:"command"`
+	CWD              string   `json:"cwd"`
+	AggregatedOutput string   `json:"aggregated_output"`
+	Stdout           string   `json:"stdout"`
+	Stderr           string   `json:"stderr"`
+	ExitCode         *int     `json:"exit_code"`
+}
+
+func extractCommitCommandContext(timestamp string, payload json.RawMessage) (commitCommandContext, bool) {
+	var item toolFunctionCall
+	if err := json.Unmarshal(payload, &item); err != nil {
+		return commitCommandContext{}, false
+	}
+	if item.Type != "function_call" || item.Name != "exec_command" || item.CallID == "" {
+		return commitCommandContext{}, false
+	}
+	args, err := parseExecCommandArguments(item.Arguments)
+	if err != nil || !isGitCommitHashCommand(args.Cmd) {
+		return commitCommandContext{}, false
+	}
+	return commitCommandContext{
+		CallID:    item.CallID,
+		Timestamp: timestamp,
+		Command:   args.Cmd,
+		CWD:       args.Workdir,
+	}, true
+}
+
+func extractCommitRefsFromFunctionCallOutput(timestamp string, payload json.RawMessage, pending map[string]commitCommandContext) []commitMatch {
+	var item toolFunctionCallOutput
+	if err := json.Unmarshal(payload, &item); err != nil {
+		return nil
+	}
+	if item.Type != "function_call_output" || item.CallID == "" {
+		return nil
+	}
+	ctx, ok := pending[item.CallID]
+	if !ok {
+		return nil
+	}
+	delete(pending, item.CallID)
+	if ctx.Timestamp == "" {
+		ctx.Timestamp = timestamp
+	}
+	return buildCommitMatches(ctx, item.Output, "function_call_output")
+}
+
+func extractCommitRefsFromExecCommandEnd(timestamp string, payload json.RawMessage) []commitMatch {
+	var item execCommandEndPayload
+	if err := json.Unmarshal(payload, &item); err != nil {
+		return nil
+	}
+	if item.Type != "exec_command_end" {
+		return nil
+	}
+	if item.ExitCode != nil && *item.ExitCode != 0 {
+		return nil
+	}
+	command := shellCommandString(item.Command)
+	if !isGitCommitHashCommand(command) {
+		return nil
+	}
+	output := item.AggregatedOutput
+	if output == "" {
+		output = strings.TrimSpace(item.Stdout + "\n" + item.Stderr)
+	}
+	ctx := commitCommandContext{
+		CallID:    item.CallID,
+		Timestamp: timestamp,
+		Command:   command,
+		CWD:       item.CWD,
+	}
+	return buildCommitMatches(ctx, output, "exec_command_end")
+}
+
+func parseExecCommandArguments(raw json.RawMessage) (execCommandArguments, error) {
+	var args execCommandArguments
+	var encoded string
+	if err := json.Unmarshal(raw, &encoded); err == nil {
+		return args, json.Unmarshal([]byte(encoded), &args)
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return execCommandArguments{}, err
+	}
+	return args, nil
+}
+
+func isGitCommitHashCommand(command string) bool {
+	normalized := strings.ToLower(normalizeWhitespace(command))
+	if normalized == "" {
+		return false
+	}
+	if !containsGitCommand(normalized) {
+		return false
+	}
+	if strings.Contains(normalized, "rev-parse") && strings.Contains(normalized, "head") {
+		return true
+	}
+	if strings.Contains(normalized, " log ") && strings.Contains(normalized, "-1") && strings.Contains(normalized, "--oneline") {
+		return true
+	}
+	return false
+}
+
+func containsGitCommand(command string) bool {
+	fields := strings.Fields(command)
+	for i, field := range fields {
+		field = strings.Trim(field, "'\"")
+		if filepath.Base(field) == "git" {
+			return true
+		}
+		if filepath.Base(field) == "rtk" && i+1 < len(fields) && filepath.Base(strings.Trim(fields[i+1], "'\"")) == "git" {
+			return true
+		}
+	}
+	return false
+}
+
+func shellCommandString(command []string) string {
+	if len(command) >= 3 {
+		shell := filepath.Base(command[0])
+		if (shell == "zsh" || shell == "bash" || shell == "sh") && command[1] == "-lc" {
+			return command[2]
+		}
+	}
+	return strings.Join(command, " ")
+}
+
+func buildCommitMatches(ctx commitCommandContext, output, source string) []commitMatch {
+	hashes := extractCommitHashesFromOutput(output)
+	matches := make([]commitMatch, 0, len(hashes))
+	for _, hash := range hashes {
+		match := commitMatch{
+			Hash:      hash,
+			Timestamp: ctx.Timestamp,
+			CWD:       ctx.CWD,
+			Command:   ctx.Command,
+			Source:    source,
+			CallID:    ctx.CallID,
+		}
+		if len(hash) == 40 {
+			match.FullHash = hash
+		}
+		matches = append(matches, match)
+	}
+	return matches
+}
+
+func extractCommitHashesFromOutput(output string) []string {
+	var hashes []string
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		hash := ""
+		if wholeCommitHashPattern.MatchString(line) {
+			hash = strings.ToLower(line)
+		} else if matches := leadingCommitHashPattern.FindStringSubmatch(line); len(matches) == 2 {
+			hash = strings.ToLower(matches[1])
+		}
+		if hash == "" || seen[hash] {
+			continue
+		}
+		seen[hash] = true
+		hashes = append(hashes, hash)
+	}
+	return hashes
+}
+
+func dedupeCommitMatches(matches []commitMatch) []commitMatch {
+	if len(matches) < 2 {
+		return matches
+	}
+	seen := make(map[string]bool, len(matches))
+	deduped := make([]commitMatch, 0, len(matches))
+	for _, match := range matches {
+		key := match.Hash + "|" + match.CallID
+		if match.CallID == "" {
+			key = match.Hash + "|" + match.Timestamp + "|" + match.CWD + "|" + match.Command
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		deduped = append(deduped, match)
+	}
+	return deduped
+}
+
+func commitMatchHasQuery(match commitMatch, query string) bool {
+	hash := strings.ToLower(match.Hash)
+	fullHash := strings.ToLower(match.FullHash)
+	if hash != "" && (hash == query || strings.HasPrefix(hash, query) || strings.HasPrefix(query, hash)) {
+		return true
+	}
+	if fullHash != "" && (fullHash == query || strings.HasPrefix(fullHash, query) || strings.HasPrefix(query, fullHash)) {
+		return true
+	}
+	return false
+}
+
+func commitIndexReady(manager indexManager, state indexState) bool {
+	for _, meta := range state.Sessions {
+		if meta.CommitIndexFile == "" {
+			return false
+		}
+		if !fileExists(filepath.Join(manager.StorageDir, meta.CommitIndexFile)) {
+			return false
+		}
+	}
+	return true
+}
+
+func countIndexedCommitRefs(state indexState) int {
+	total := 0
+	for _, meta := range state.Sessions {
+		total += meta.CommitCount
+	}
+	return total
 }
 
 func parseIndexedTime(meta indexedSessionMeta) time.Time {

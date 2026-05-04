@@ -34,6 +34,7 @@ type daemonStatus struct {
 	LastRefreshCompletedAt string `json:"last_refresh_completed_at,omitempty"`
 	LastError              string `json:"last_error,omitempty"`
 	IndexedSessions        int    `json:"indexed_sessions,omitempty"`
+	IndexedCommitRefs      int    `json:"indexed_commit_refs,omitempty"`
 	ChangedSessions        int    `json:"changed_sessions,omitempty"`
 	DeletedSessions        int    `json:"deleted_sessions,omitempty"`
 	Running                bool   `json:"running"`
@@ -84,6 +85,7 @@ func runIndexCommand(args []string) int {
 		}
 		fmt.Printf("Index refreshed.\n")
 		fmt.Printf("Indexed sessions: %d\n", result.IndexedSessions)
+		fmt.Printf("Indexed commit refs: %d\n", result.IndexedCommitRefs)
 		fmt.Printf("Changed sessions: %d\n", result.ChangedSessions)
 		fmt.Printf("Deleted sessions: %d\n", result.DeletedSessions)
 		fmt.Printf("Unchanged sessions: %d\n", result.UnchangedSessions)
@@ -98,6 +100,7 @@ func runIndexCommand(args []string) int {
 		fmt.Printf("Index root: %s\n", manager.Root)
 		fmt.Printf("Index storage: %s\n", manager.StorageDir)
 		fmt.Printf("Indexed sessions: %d\n", len(state.Sessions))
+		fmt.Printf("Indexed commit refs: %d\n", countIndexedCommitRefs(state))
 		fmt.Printf("Updated at: %s\n", nonEmpty(state.UpdatedAt, "(never)"))
 		return 0
 	default:
@@ -215,6 +218,7 @@ func runDaemonLoop(manager indexManager, interval time.Duration) int {
 		} else {
 			status.LastError = ""
 			status.IndexedSessions = result.IndexedSessions
+			status.IndexedCommitRefs = result.IndexedCommitRefs
 			status.ChangedSessions = result.ChangedSessions
 			status.DeletedSessions = result.DeletedSessions
 			status.LastRefreshCompletedAt = result.UpdatedAt.Format(time.RFC3339)
@@ -436,6 +440,9 @@ func printDaemonStatus(manager indexManager) int {
 	}
 	if status.IndexedSessions > 0 {
 		fmt.Printf("Indexed sessions: %d\n", status.IndexedSessions)
+	}
+	if status.IndexedCommitRefs > 0 {
+		fmt.Printf("Indexed commit refs: %d\n", status.IndexedCommitRefs)
 	}
 	if status.LastError != "" {
 		fmt.Printf("Last error: %s\n", status.LastError)

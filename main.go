@@ -28,6 +28,7 @@ var relativeWindowPattern = regexp.MustCompile(`(?i)^\s*(\d+)\s*(mon|mons|month|
 
 type config struct {
 	Query         string
+	CommitQuery   string
 	From          string
 	To            string
 	Last          string
@@ -90,21 +91,35 @@ type snippet struct {
 }
 
 type result struct {
-	ID           string    `json:"id"`
-	Title        string    `json:"title,omitempty"`
-	UpdatedAt    string    `json:"updated_at,omitempty"`
-	Date         string    `json:"date,omitempty"`
-	StartedAt    string    `json:"started_at,omitempty"`
-	CWD          string    `json:"cwd,omitempty"`
-	Path         string    `json:"path"`
-	MatchCount   int       `json:"match_count"`
-	TitleMatched bool      `json:"title_matched"`
-	Resume       string    `json:"resume"`
-	Snippets     []snippet `json:"snippets,omitempty"`
+	ID            string        `json:"id"`
+	Title         string        `json:"title,omitempty"`
+	UpdatedAt     string        `json:"updated_at,omitempty"`
+	Date          string        `json:"date,omitempty"`
+	StartedAt     string        `json:"started_at,omitempty"`
+	CWD           string        `json:"cwd,omitempty"`
+	Path          string        `json:"path"`
+	MatchCount    int           `json:"match_count"`
+	TitleMatched  bool          `json:"title_matched"`
+	CommitMatched bool          `json:"commit_matched,omitempty"`
+	Resume        string        `json:"resume"`
+	Snippets      []snippet     `json:"snippets,omitempty"`
+	CommitMatches []commitMatch `json:"commit_matches,omitempty"`
+}
+
+type commitMatch struct {
+	Hash      string `json:"hash"`
+	FullHash  string `json:"full_hash,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+	CWD       string `json:"cwd,omitempty"`
+	Command   string `json:"command,omitempty"`
+	Source    string `json:"source,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
 }
 
 type jsonOutput struct {
 	Query           string         `json:"query"`
+	SearchMode      string         `json:"search_mode,omitempty"`
+	CommitQuery     string         `json:"commit_query,omitempty"`
 	RoleFilter      string         `json:"role_filter,omitempty"`
 	ScannedSessions int            `json:"scanned_sessions"`
 	Elapsed         string         `json:"elapsed"`
@@ -159,8 +174,19 @@ func runIndexedSearch(cfg config) (int, bool) {
 		return 0, false
 	}
 	start := time.Now()
-	results, warnings, scanned, err := searchWithIndex(manager, cfg)
+	var results []result
+	var warnings []string
+	var scanned int
+	if cfg.CommitQuery != "" {
+		results, warnings, scanned, err = searchCommitsWithIndex(manager, cfg)
+	} else {
+		results, warnings, scanned, err = searchWithIndex(manager, cfg)
+	}
 	if err != nil {
+		if cfg.CommitQuery != "" {
+			fmt.Fprintf(os.Stderr, "error: search commit index: %v\n", err)
+			return 1, true
+		}
 		return 0, false
 	}
 	elapsed := time.Since(start)
@@ -171,6 +197,8 @@ func runIndexedSearch(cfg config) (int, bool) {
 	if cfg.JSON {
 		out := jsonOutput{
 			Query:           cfg.Query,
+			SearchMode:      searchMode(cfg),
+			CommitQuery:     cfg.CommitQuery,
 			RoleFilter:      cfg.Role,
 			ScannedSessions: scanned,
 			Elapsed:         elapsed.Round(time.Millisecond).String(),
@@ -343,6 +371,13 @@ func parseArgs(args []string) (config, error) {
 			}
 			cfg.Root = value
 			i = next
+		case "--commit":
+			value, next, err := nextValue(args, i, arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.CommitQuery = value
+			i = next
 		case "--json":
 			cfg.JSON = true
 		case "--case-sensitive":
@@ -373,8 +408,11 @@ func parseArgs(args []string) (config, error) {
 		}
 	}
 
-	if len(queryParts) == 0 {
+	if len(queryParts) == 0 && cfg.CommitQuery == "" {
 		return cfg, errors.New("missing search query")
+	}
+	if len(queryParts) > 0 && cfg.CommitQuery != "" {
+		return cfg, errors.New("--commit cannot be combined with a text query")
 	}
 	if cfg.Limit < 0 {
 		return cfg, errors.New("--limit must be >= 0")
@@ -384,6 +422,9 @@ func parseArgs(args []string) (config, error) {
 	}
 	if !validRole(cfg.Role) {
 		return cfg, errors.New("--role must be one of: all, assistant, user")
+	}
+	if cfg.CommitQuery != "" && cfg.Role != "all" {
+		return cfg, errors.New("--commit cannot be combined with role filters")
 	}
 	if !validView(cfg.View) {
 		return cfg, errors.New("--view must be one of: compact, full")
@@ -409,12 +450,23 @@ func parseArgs(args []string) (config, error) {
 		cfg.LastSince = since
 		cfg.LastUntil = until
 	}
+	if cfg.CommitQuery != "" {
+		normalized, err := normalizeCommitHashQuery(cfg.CommitQuery)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid --commit: %w", err)
+		}
+		cfg.CommitQuery = normalized
+	}
 	root, err := expandPath(cfg.Root)
 	if err != nil {
 		return cfg, fmt.Errorf("resolve --root: %w", err)
 	}
 	cfg.Root = root
-	cfg.Query = strings.Join(queryParts, " ")
+	if cfg.CommitQuery != "" {
+		cfg.Query = cfg.CommitQuery
+	} else {
+		cfg.Query = strings.Join(queryParts, " ")
+	}
 	return cfg, nil
 }
 
@@ -878,6 +930,27 @@ func makeMatcher(query string, caseSensitive bool) func(string) bool {
 	}
 }
 
+func normalizeCommitHashQuery(raw string) (string, error) {
+	hash := strings.ToLower(strings.TrimSpace(raw))
+	if len(hash) < 4 || len(hash) > 40 {
+		return "", errors.New("expected a 4-40 character hexadecimal git hash")
+	}
+	for _, r := range hash {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			continue
+		}
+		return "", errors.New("expected a hexadecimal git hash")
+	}
+	return hash, nil
+}
+
+func searchMode(cfg config) string {
+	if cfg.CommitQuery != "" {
+		return "commit"
+	}
+	return ""
+}
+
 func sortResults(results []result) {
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].TitleMatched != results[j].TitleMatched {
@@ -948,8 +1021,12 @@ func extractSessionID(path string) string {
 
 func printText(results []result, warnings []string, scanned int, elapsed time.Duration, cfg config) {
 	theme := detectOutputTheme()
+	target := fmt.Sprintf("%q", cfg.Query)
+	if cfg.CommitQuery != "" {
+		target = "commit " + cfg.CommitQuery
+	}
 	if len(results) == 0 {
-		fmt.Printf("%s for %q. Scanned %d sessions in %s.\n", style(theme, "red+bold", "No matches"), cfg.Query, scanned, elapsed.Round(time.Millisecond))
+		fmt.Printf("%s for %s. Scanned %d sessions in %s.\n", style(theme, "red+bold", "No matches"), target, scanned, elapsed.Round(time.Millisecond))
 		printDateRange(cfg)
 		printLastWindow(cfg)
 		printRoleFilter(cfg)
@@ -957,7 +1034,7 @@ func printText(results []result, warnings []string, scanned int, elapsed time.Du
 		return
 	}
 
-	fmt.Printf("%s %d matching sessions for %q. Scanned %d sessions in %s.\n", style(theme, "green+bold", "Found"), len(results), cfg.Query, scanned, elapsed.Round(time.Millisecond))
+	fmt.Printf("%s %d matching sessions for %s. Scanned %d sessions in %s.\n", style(theme, "green+bold", "Found"), len(results), target, scanned, elapsed.Round(time.Millisecond))
 	printDateRange(cfg)
 	printLastWindow(cfg)
 	printRoleFilter(cfg)
@@ -979,6 +1056,9 @@ func printCompactResults(results []result, cfg config, theme outputTheme) {
 		if snip := firstSnippet(res); snip != nil {
 			role, text := snippetPreview(*snip, cfg, theme)
 			fmt.Printf("    %s %s\n", style(theme, "yellow+bold", padRole(role)), text)
+		}
+		if match := firstCommitMatch(res); match != nil {
+			fmt.Printf("    %s %s\n", style(theme, "yellow+bold", "commit  "), commitMatchPreview(*match, cfg, theme))
 		}
 		fmt.Printf("    %s %s\n", style(theme, "dim", "resume"), style(theme, "blue", res.Resume))
 		fmt.Println()
@@ -1017,6 +1097,25 @@ func printFullResults(results []result, cfg config, theme outputTheme) {
 			fmt.Printf("      %s %s\n", style(theme, "yellow+bold", "["+snip.Match.Role+"]"), highlightText(shorten(snip.Match.Text, cfg.Query, cfg.CaseSensitive, 180), cfg.Query, cfg.CaseSensitive, theme))
 			if snip.After != nil {
 				fmt.Printf("      %s %s\n", style(theme, "dim", "["+snip.After.Role+"]"), highlightText(shorten(snip.After.Text, cfg.Query, cfg.CaseSensitive, 180), cfg.Query, cfg.CaseSensitive, theme))
+			}
+		}
+		for idx, match := range res.CommitMatches {
+			fmt.Printf("    %s %d\n", style(theme, "magenta+bold", "commit"), idx+1)
+			fmt.Printf("      %s %s\n", style(theme, "yellow+bold", "[hash]"), highlightCommitHash(match.Hash, cfg, theme))
+			if match.FullHash != "" && match.FullHash != match.Hash {
+				fmt.Printf("      %s %s\n", style(theme, "dim", "[full]"), highlightCommitHash(match.FullHash, cfg, theme))
+			}
+			if match.Timestamp != "" {
+				fmt.Printf("      %s %s\n", style(theme, "dim", "[time]"), trimTimestamp(match.Timestamp))
+			}
+			if match.CWD != "" {
+				fmt.Printf("      %s %s\n", style(theme, "dim", "[cwd]"), match.CWD)
+			}
+			if match.Command != "" {
+				fmt.Printf("      %s %s\n", style(theme, "dim", "[cmd]"), match.Command)
+			}
+			if match.Source != "" {
+				fmt.Printf("      %s %s\n", style(theme, "dim", "[source]"), match.Source)
 			}
 		}
 		fmt.Println()
@@ -1139,6 +1238,9 @@ func compactMetaLine(res result) string {
 	if res.TitleMatched {
 		parts = append(parts, "title")
 	}
+	if res.CommitMatched {
+		parts = append(parts, fmt.Sprintf("commits:%d", res.MatchCount))
+	}
 	return strings.Join(parts, " | ")
 }
 
@@ -1150,9 +1252,43 @@ func firstSnippet(res result) *snippet {
 	return &snip
 }
 
+func firstCommitMatch(res result) *commitMatch {
+	if len(res.CommitMatches) == 0 {
+		return nil
+	}
+	match := res.CommitMatches[0]
+	return &match
+}
+
 func snippetPreview(snip snippet, cfg config, theme outputTheme) (string, string) {
 	text := shorten(snip.Match.Text, cfg.Query, cfg.CaseSensitive, 140)
 	return snip.Match.Role, highlightText(text, cfg.Query, cfg.CaseSensitive, theme)
+}
+
+func commitMatchPreview(match commitMatch, cfg config, theme outputTheme) string {
+	var parts []string
+	parts = append(parts, highlightCommitHash(match.Hash, cfg, theme))
+	if match.CWD != "" {
+		parts = append(parts, "cwd:"+pathTail(match.CWD))
+	}
+	if match.Timestamp != "" {
+		parts = append(parts, trimTimestamp(match.Timestamp))
+	}
+	if match.Source != "" {
+		parts = append(parts, match.Source)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func highlightCommitHash(hash string, cfg config, theme outputTheme) string {
+	if !theme.Color || cfg.CommitQuery == "" || hash == "" {
+		return hash
+	}
+	lowerHash := strings.ToLower(hash)
+	if strings.HasPrefix(lowerHash, cfg.CommitQuery) || strings.HasPrefix(cfg.CommitQuery, lowerHash) {
+		return style(theme, "yellow+bold", hash)
+	}
+	return hash
 }
 
 func padRole(role string) string {
@@ -1299,6 +1435,7 @@ func printUsage(out *os.File) {
 	fmt.Fprintln(out, "  --limit N             Max sessions to print (0 = all, default 10)")
 	fmt.Fprintln(out, "  --snippets N          Max contexts per session (default 2)")
 	fmt.Fprintln(out, "  --root PATH           Codex home directory (default ~/.codex)")
+	fmt.Fprintln(out, "  --commit HASH         Search the separate git commit-hash index")
 	fmt.Fprintln(out, "  --json                Emit JSON")
 	fmt.Fprintln(out, "  --case-sensitive      Use case-sensitive matching")
 	fmt.Fprintln(out, "  --role VALUE          all | assistant | user (default all)")
@@ -1311,6 +1448,7 @@ func printUsage(out *os.File) {
 	fmt.Fprintln(out, "  codex-session-search --role assistant \"SQLite\"")
 	fmt.Fprintln(out, "  codex-session-search --last 3d \"SRT\"")
 	fmt.Fprintln(out, "  codex-session-search --last 3h --assistant-only \"上下文\"")
+	fmt.Fprintln(out, "  codex-session-search --commit fb5ef21")
 	fmt.Fprintln(out, "  codex-session-search --view full --limit 5 \"drama_workspace\"")
 	fmt.Fprintln(out, "  codex-session-search --from 2026-04-01 --to 2026-04-20 \"renderwarden\"")
 	fmt.Fprintln(out, "  codex-session-search --on 2026-04-20 --limit 5 \"SRT\"")

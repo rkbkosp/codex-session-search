@@ -14,6 +14,7 @@ It supports:
 - Relative time filters (`--last 3d`, `--last 3h`, `--last 90min`, `--last 3mon`)
 - Assistant-only or user-only search
 - Persistent lightweight index
+- Separate git commit-hash index for reverse lookup from hashes to sessions
 - Continuous background refresh on macOS via LaunchAgent or on Linux via `systemd --user`
 
 The tool defaults to `~/.codex` as Codex home and searches `~/.codex/sessions`.
@@ -110,6 +111,13 @@ codex-session-search --last 3h --assistant-only "上下文"
 codex-session-search --last 90min "drama_workspace"
 ```
 
+Search by git commit hash using the separate commit index:
+
+```bash
+codex-session-search --commit fb5ef21
+codex-session-search --commit fb5ef21 --view full
+```
+
 Search one day only:
 
 ```bash
@@ -170,6 +178,7 @@ Flags:
 - `--limit N`: max number of printed results, `0` means all
 - `--snippets N`: max number of context blocks per session
 - `--root PATH`: Codex home directory, default `~/.codex`
+- `--commit HASH`: search the separate git commit-hash index instead of default text search
 - `--json`: JSON output
 - `--case-sensitive`: case-sensitive matching
 - `--role all|assistant|user`: role filter
@@ -182,6 +191,8 @@ Notes:
 - `--last` cannot be combined with `--from`, `--to`, or `--on`
 - `--limit` only controls output size, not how many candidate sessions are evaluated
 - Search prefers the lightweight index; if indexed search cannot be used, the code still retains a raw-scan fallback path
+- `--commit` is a separate search mode and cannot be combined with a text query
+- Short hashes are matched as prefixes. If a session only contains `git rev-parse --short HEAD` output, the index cannot reconstruct the full 40-character hash from JSONL alone.
 - ANSI color/highlighting is enabled only when writing to an interactive terminal
 
 ## Index Commands
@@ -223,6 +234,30 @@ It does not duplicate:
 - tool output blobs
 - encrypted reasoning payloads
 - most wrapper metadata
+
+### Git Commit-Hash Index
+
+The index also stores commit hashes returned by git-related tool calls in a separate per-session index under `commits/`.
+
+The extractor recognizes successful tool results for commands such as:
+
+- `git rev-parse --short HEAD`
+- `git -C /path/to/repo rev-parse --short HEAD`
+- `rtk git rev-parse --short HEAD`
+- `git log -1 --oneline`
+
+This covers both normal `function_call_output` payloads and rtk-cleaned `event_msg.exec_command_end` payloads where the hash is preserved in `aggregated_output`.
+
+For each indexed hash, the commit index stores:
+
+- observed hash
+- full hash, only when the tool output already contains 40 hexadecimal characters
+- timestamp
+- command cwd
+- command text
+- source payload type
+
+The index deliberately does not run `git` against historical working directories during normal refresh. That keeps daemon indexing deterministic and avoids stale or missing local repository state. When only a short hash is present, `--commit` treats it as a prefix and may return multiple sessions if the prefix is not unique.
 
 ## Background Daemon
 
@@ -292,6 +327,9 @@ runtime/<hash>/
 ├── daemon-status.json
 ├── daemon.stdout.log
 ├── daemon.stderr.log
+├── commits/
+│   ├── 0166da8720ba8cde.jsonl
+│   └── ...
 └── sessions/
     ├── 0166da8720ba8cde.jsonl
     ├── 01b82402978d8b4c.jsonl
@@ -304,6 +342,7 @@ Meaning:
 - `daemon-status.json`: last daemon heartbeat and refresh status
 - `daemon.stdout.log`: daemon stdout log
 - `daemon.stderr.log`: daemon stderr log
+- `commits/*.jsonl`: extracted per-session git commit-hash references
 - `sessions/*.jsonl`: extracted lightweight per-session message logs
 
 The service file path depends on platform:
