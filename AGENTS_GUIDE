@@ -2,7 +2,7 @@
 
 This guide is for AI coding agents installing `github.com/rkbkosp/codex-session-search` for a user.
 
-`codex-session-search` is a Go CLI for searching local Codex session history under `~/.codex/sessions`.
+`codex-session-search` is a Go CLI/TUI for searching local Codex session history under `~/.codex/sessions`.
 
 ## Important Notes For Agents
 
@@ -82,7 +82,7 @@ Updated at: <timestamp>
 
 ## Test Search
 
-Run a small query to confirm search works:
+Run a small one-shot CLI query to confirm search works:
 
 codex-session-search --limit 1 codex
 
@@ -110,9 +110,17 @@ codex-session-search daemon uninstall
 
 ## Common Commands
 
-Search all indexed sessions:
+Open the main TUI:
+
+codex-session-search
+
+Open the search TUI with a prefilled query:
 
 codex-session-search "query"
+
+Search all indexed sessions with one-shot CLI output:
+
+codex-session-search --limit 10 "query"
 
 Search recent sessions:
 
@@ -140,7 +148,7 @@ codex-session-search --json --limit 20 "query"
 
 This means the agent tried to install the repository as a Codex skill. That is incorrect.
 
-Install it as a Go CLI instead.
+Install it as a Go binary instead.
 
 ### codex-session-search: command not found
 
@@ -179,4 +187,4 @@ After a successful install, summarize:
 Installed codex-session-search to ~/.local/bin/codex-session-search.
 Verified the CLI with --help.
 Refreshed the index and indexed N sessions.
-You can search with: codex-session-search "query".
+You can open the TUI with: codex-session-search

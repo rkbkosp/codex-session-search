@@ -150,11 +150,20 @@ type outputTheme struct {
 }
 
 func main() {
-	if handled, code := handleSubcommand(os.Args[1:]); handled {
+	args := os.Args[1:]
+	if shouldHandleSubcommand(args) {
+		_, code := handleSubcommand(args)
 		os.Exit(code)
 	}
+	if shouldRunTUI(args) {
+		if err := runTUI(args); err != nil {
+			fmt.Fprintf(os.Stderr, "error: tui: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
-	cfg, err := parseArgs(os.Args[1:])
+	cfg, err := parseArgs(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n\n", err)
 		printUsage(os.Stderr)
@@ -166,6 +175,28 @@ func main() {
 	}
 
 	runRawSearch(cfg)
+}
+
+func shouldHandleSubcommand(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	return args[0] == "index" || args[0] == "daemon"
+}
+
+func shouldRunTUI(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	if shouldHandleSubcommand(args) {
+		return false
+	}
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			return false
+		}
+	}
+	return true
 }
 
 func runIndexedSearch(cfg config) (int, bool) {
@@ -1421,11 +1452,17 @@ func trimWindow(text string, start, end int) string {
 
 func printUsage(out *os.File) {
 	fmt.Fprintln(out, "Usage:")
+	fmt.Fprintln(out, "  codex-session-search")
+	fmt.Fprintln(out, "  codex-session-search <query>")
 	fmt.Fprintln(out, "  codex-session-search [flags] <query>")
 	fmt.Fprintln(out, "  codex-session-search index refresh [--root PATH] [--resolve-commits]")
 	fmt.Fprintln(out, "  codex-session-search index status [--root PATH]")
 	fmt.Fprintln(out, "  codex-session-search daemon install [--root PATH] [--interval 15s] [--resolve-commits]")
 	fmt.Fprintln(out, "  codex-session-search daemon start|stop|status|uninstall [--root PATH]")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "TUI:")
+	fmt.Fprintln(out, "  No arguments open the main TUI. Plain query arguments open the search TUI.")
+	fmt.Fprintln(out, "  Use flags when you want one-shot CLI output instead of the TUI.")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Flags:")
 	fmt.Fprintln(out, "  --from YYYY-MM-DD     Inclusive start date")
@@ -1445,7 +1482,9 @@ func printUsage(out *os.File) {
 	fmt.Fprintln(out, "  --resolve-commits    For index/daemon commands, resolve short commit hashes via local git repos")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Examples:")
+	fmt.Fprintln(out, "  codex-session-search")
 	fmt.Fprintln(out, "  codex-session-search \"什么是Go语言\"")
+	fmt.Fprintln(out, "  codex-session-search --limit 10 \"什么是Go语言\"")
 	fmt.Fprintln(out, "  codex-session-search --role assistant \"SQLite\"")
 	fmt.Fprintln(out, "  codex-session-search --last 3d \"SRT\"")
 	fmt.Fprintln(out, "  codex-session-search --last 3h --assistant-only \"上下文\"")

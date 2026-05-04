@@ -7,6 +7,7 @@ It supports:
 - Full-text search across user and assistant natural-language messages
 - Session title matching
 - Context snippets around each hit
+- Full-screen TUI for search, selection, launch, and clipboard copy
 - Compact default terminal view plus expandable full view
 - ANSI highlighting in interactive terminals
 - `codex resume <session-id>` output for every match
@@ -36,7 +37,7 @@ On the current machine, raw sessions are about `1.3G`, while the extracted index
 - Codex session data under `~/.codex`
 - macOS with `launchctl`, or Linux with `systemd --user`, if you want built-in background daemon management
 
-Search itself is plain Go and does not require third-party dependencies.
+The binary uses Bubble Tea, Bubbles, and Lip Gloss for the TUI layer.
 
 ## Source Layout
 
@@ -44,7 +45,9 @@ Search itself is plain Go and does not require third-party dependencies.
 .
 ├── README.md
 ├── go.mod
+├── go.sum
 ├── main.go
+├── tui.go
 ├── index.go
 ├── daemon.go
 └── runtime/                  # generated at runtime, not source
@@ -53,6 +56,7 @@ Search itself is plain Go and does not require third-party dependencies.
 File roles:
 
 - `main.go`: CLI parsing, raw search fallback, text/json output
+- `tui.go`: interactive TUI, launch commands, clipboard copy, search orchestration
 - `index.go`: lightweight index storage, incremental refresh, indexed search
 - `daemon.go`: index/daemon subcommands, macOS LaunchAgent and Linux systemd user-service management
 
@@ -79,10 +83,22 @@ ln -sf ~/.local/bin/codex-session-search ~/.local/bin/codex-sesssion-search
 
 ## Quick Start
 
-Search all indexed sessions:
+Open the main TUI:
+
+```bash
+codex-session-search
+```
+
+Start the search TUI with a prefilled query:
 
 ```bash
 codex-session-search "什么是Go语言"
+```
+
+Use a flag to stay in one-shot CLI mode:
+
+```bash
+codex-session-search --limit 10 "什么是Go语言"
 ```
 
 Show expanded output:
@@ -130,6 +146,16 @@ Emit JSON:
 codex-session-search --json --last 3h "codex session"
 ```
 
+In the TUI:
+
+- Left and right switch between normal search and git commit hash search
+- Enter runs the search
+- Up and down move the selected session
+- Tab switches the launch mode between CLI and deep link (`open codex://threads/<session id>` on macOS)
+- `c` copies the current launch command
+- `r` forces CLI launch
+- `q` quits from the results screen
+
 ## Search Behavior
 
 By default, the tool searches:
@@ -169,6 +195,8 @@ resume: codex resume 019da989-f055-73c3-a63a-be89183a180b
 codex-session-search [flags] <query>
 ```
 
+Plain query arguments open the TUI. Add a search flag such as `--limit`, `--json`, `--view`, `--role`, `--from`, `--to`, or `--last` when you want one-shot CLI output instead.
+
 Flags:
 
 - `--from YYYY-MM-DD`: inclusive start date
@@ -195,6 +223,7 @@ Notes:
 - `--commit` is a separate search mode and cannot be combined with a text query
 - Short hashes are matched as prefixes. If a session only contains `git rev-parse --short HEAD` output, the index cannot reconstruct the full 40-character hash from JSONL alone.
 - ANSI color/highlighting is enabled only when writing to an interactive terminal
+- `--commit` and plain query arguments still search the same data, but the bare query path now opens the TUI instead of printing results directly
 
 ## Index Commands
 
@@ -468,7 +497,7 @@ codex-session-search --limit 0 "query"
 - The daemon integrates with `launchctl` on macOS and `systemctl --user` on Linux
 - The index format is designed to be disposable; you can delete the runtime directory and rebuild it
 - The raw search path still exists as a fallback implementation
-- The project currently uses only the Go standard library
+- The TUI uses Bubble Tea, Bubbles, and Lip Gloss
 
 ## Typical Workflow
 
