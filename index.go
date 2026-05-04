@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -16,6 +18,7 @@ import (
 )
 
 const indexVersion = 2
+const commitResolveTimeout = 2 * time.Second
 
 var (
 	wholeCommitHashPattern   = regexp.MustCompile(`(?i)^[0-9a-f]{4,40}$`)
@@ -57,15 +60,22 @@ type indexedSessionMeta struct {
 	CommitIndexFile string `json:"commit_index_file,omitempty"`
 	MessageCount    int    `json:"message_count"`
 	CommitCount     int    `json:"commit_count,omitempty"`
+	FullCommitCount int    `json:"full_commit_count,omitempty"`
+	CommitResolved  bool   `json:"commit_resolved,omitempty"`
 }
 
 type refreshResult struct {
 	IndexedSessions   int       `json:"indexed_sessions"`
 	IndexedCommitRefs int       `json:"indexed_commit_refs"`
+	FullCommitRefs    int       `json:"full_commit_refs"`
 	ChangedSessions   int       `json:"changed_sessions"`
 	DeletedSessions   int       `json:"deleted_sessions"`
 	UnchangedSessions int       `json:"unchanged_sessions"`
 	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+type refreshOptions struct {
+	ResolveCommits bool
 }
 
 func newIndexManager(root string) (indexManager, error) {
@@ -141,6 +151,10 @@ func saveIndexState(manager indexManager, state indexState) error {
 }
 
 func refreshIndex(manager indexManager) (refreshResult, error) {
+	return refreshIndexWithOptions(manager, refreshOptions{})
+}
+
+func refreshIndexWithOptions(manager indexManager, options refreshOptions) (refreshResult, error) {
 	if err := ensureIndexDirs(manager); err != nil {
 		return refreshResult{}, err
 	}
@@ -176,6 +190,7 @@ func refreshIndex(manager indexManager) (refreshResult, error) {
 			prev.ModTimeUnixNano == info.ModTime().UnixNano() &&
 			prev.IndexFile != "" &&
 			prev.CommitIndexFile != "" &&
+			(!options.ResolveCommits || prev.CommitResolved) &&
 			fileExists(filepath.Join(manager.StorageDir, prev.CommitIndexFile)) &&
 			fileExists(filepath.Join(manager.StorageDir, prev.IndexFile)) {
 			result.UnchangedSessions++
@@ -191,6 +206,12 @@ func refreshIndex(manager indexManager) (refreshResult, error) {
 		meta.ModTimeUnixNano = info.ModTime().UnixNano()
 		meta.IndexFile = filepath.Join("sessions", indexFileName(file.Path))
 		meta.CommitIndexFile = filepath.Join("commits", indexFileName(file.Path))
+		if options.ResolveCommits {
+			commitRefs = resolveCommitFullHashes(commitRefs)
+			meta.CommitResolved = true
+		}
+		meta.CommitCount = len(commitRefs)
+		meta.FullCommitCount = countFullCommitMatches(commitRefs)
 
 		indexPath := filepath.Join(manager.StorageDir, meta.IndexFile)
 		if err := writeIndexedMessages(indexPath, messages); err != nil {
@@ -221,6 +242,7 @@ func refreshIndex(manager indexManager) (refreshResult, error) {
 
 	result.IndexedSessions = len(state.Sessions)
 	result.IndexedCommitRefs = countIndexedCommitRefs(state)
+	result.FullCommitRefs = countFullCommitRefs(state)
 	result.UpdatedAt = time.Now()
 	state.UpdatedAt = result.UpdatedAt.Format(time.RFC3339)
 	if err := saveIndexState(manager, state); err != nil {
@@ -684,7 +706,7 @@ func isGitCommitHashCommand(command string) bool {
 }
 
 func containsGitCommand(command string) bool {
-	fields := strings.Fields(command)
+	fields := splitCommandFields(command)
 	for i, field := range fields {
 		field = strings.Trim(field, "'\"")
 		if filepath.Base(field) == "git" {
@@ -725,6 +747,129 @@ func buildCommitMatches(ctx commitCommandContext, output, source string) []commi
 		matches = append(matches, match)
 	}
 	return matches
+}
+
+func resolveCommitFullHashes(matches []commitMatch) []commitMatch {
+	if len(matches) == 0 {
+		return matches
+	}
+	resolved := make([]commitMatch, len(matches))
+	copy(resolved, matches)
+	cache := make(map[string]string)
+	for i := range resolved {
+		if resolved[i].FullHash != "" || len(resolved[i].Hash) == 40 {
+			if resolved[i].FullHash == "" {
+				resolved[i].FullHash = resolved[i].Hash
+			}
+			continue
+		}
+		dir := commitResolveDir(resolved[i])
+		if dir == "" {
+			continue
+		}
+		key := dir + "|" + resolved[i].Hash
+		full, ok := cache[key]
+		if !ok {
+			full = resolveCommitFullHash(dir, resolved[i].Hash)
+			cache[key] = full
+		}
+		if full != "" {
+			resolved[i].FullHash = full
+		}
+	}
+	return resolved
+}
+
+func commitResolveDir(match commitMatch) string {
+	dir := gitCOptionDir(match.Command, match.CWD)
+	if dir != "" {
+		return dir
+	}
+	return match.CWD
+}
+
+func gitCOptionDir(command, cwd string) string {
+	fields := splitCommandFields(command)
+	resolvedDir := ""
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] != "-C" {
+			continue
+		}
+		dir := fields[i+1]
+		if dir == "" {
+			return ""
+		}
+		if filepath.IsAbs(dir) || cwd == "" {
+			dir = filepath.Clean(dir)
+		} else {
+			dir = filepath.Clean(filepath.Join(cwd, dir))
+		}
+		if resolvedDir != "" && resolvedDir != dir {
+			return ""
+		}
+		resolvedDir = dir
+	}
+	return resolvedDir
+}
+
+func splitCommandFields(command string) []string {
+	var fields []string
+	var builder strings.Builder
+	var quote rune
+	escaped := false
+	for _, r := range command {
+		if escaped {
+			builder.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+				continue
+			}
+			builder.WriteRune(r)
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			continue
+		}
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			if builder.Len() > 0 {
+				fields = append(fields, builder.String())
+				builder.Reset()
+			}
+			continue
+		}
+		builder.WriteRune(r)
+	}
+	if builder.Len() > 0 {
+		fields = append(fields, builder.String())
+	}
+	return fields
+}
+
+func resolveCommitFullHash(dir, hash string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), commitResolveTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", hash+"^{commit}")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	candidates := extractCommitHashesFromOutput(string(output))
+	for _, candidate := range candidates {
+		if len(candidate) == 40 {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func extractCommitHashesFromOutput(output string) []string {
@@ -798,6 +943,24 @@ func countIndexedCommitRefs(state indexState) int {
 	total := 0
 	for _, meta := range state.Sessions {
 		total += meta.CommitCount
+	}
+	return total
+}
+
+func countFullCommitRefs(state indexState) int {
+	total := 0
+	for _, meta := range state.Sessions {
+		total += meta.FullCommitCount
+	}
+	return total
+}
+
+func countFullCommitMatches(matches []commitMatch) int {
+	total := 0
+	for _, match := range matches {
+		if match.FullHash != "" {
+			total++
+		}
 	}
 	return total
 }

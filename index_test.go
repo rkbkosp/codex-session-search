@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -64,6 +65,44 @@ func TestCommitMatchHasQueryHandlesPrefixes(t *testing.T) {
 	}
 }
 
+func TestResolveCommitFullHashesFromLocalGitRepo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	repo := t.TempDir()
+	run(t, repo, "git", "init")
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "git", "add", "file.txt")
+	run(t, repo, "git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "initial")
+	short := run(t, repo, "git", "rev-parse", "--short", "HEAD")
+	full := run(t, repo, "git", "rev-parse", "HEAD")
+
+	matches := resolveCommitFullHashes([]commitMatch{{
+		Hash:    short,
+		CWD:     repo,
+		Command: "git rev-parse --short HEAD",
+	}})
+	if len(matches) != 1 {
+		t.Fatalf("len(matches) = %d, want 1", len(matches))
+	}
+	if matches[0].FullHash != full {
+		t.Fatalf("FullHash = %q, want %q", matches[0].FullHash, full)
+	}
+}
+
+func TestGitCOptionDirSkipsMultipleRepos(t *testing.T) {
+	dir := gitCOptionDir("git -C repo-a rev-parse --short HEAD && git -C repo-b rev-parse --short HEAD", "/tmp/root")
+	if dir != "" {
+		t.Fatalf("dir = %q, want empty for multiple repo command", dir)
+	}
+	dir = gitCOptionDir("git -C repo-a status && git -C repo-a rev-parse --short HEAD", "/tmp/root")
+	if dir != filepath.Clean("/tmp/root/repo-a") {
+		t.Fatalf("dir = %q, want /tmp/root/repo-a", dir)
+	}
+}
+
 func TestSearchCommitsWithIndex(t *testing.T) {
 	temp := t.TempDir()
 	root := filepath.Join(temp, "codex")
@@ -121,6 +160,17 @@ func TestSearchCommitsWithIndex(t *testing.T) {
 	if len(results[0].CommitMatches) != 1 || results[0].CommitMatches[0].Hash != "fb5ef21" {
 		t.Fatalf("commit matches = %#v", results[0].CommitMatches)
 	}
+}
+
+func run(t *testing.T, dir string, name string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s %v failed: %v\n%s", name, args, err, output)
+	}
+	return normalizeWhitespace(string(output))
 }
 
 func jsonLine(t *testing.T, value interface{}) string {

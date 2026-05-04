@@ -20,8 +20,9 @@ import (
 const defaultDaemonInterval = 15 * time.Second
 
 type daemonCommandConfig struct {
-	Root     string
-	Interval time.Duration
+	Root           string
+	Interval       time.Duration
+	ResolveCommits bool
 }
 
 type daemonStatus struct {
@@ -35,6 +36,8 @@ type daemonStatus struct {
 	LastError              string `json:"last_error,omitempty"`
 	IndexedSessions        int    `json:"indexed_sessions,omitempty"`
 	IndexedCommitRefs      int    `json:"indexed_commit_refs,omitempty"`
+	FullCommitRefs         int    `json:"full_commit_refs,omitempty"`
+	ResolveCommits         bool   `json:"resolve_commits,omitempty"`
 	ChangedSessions        int    `json:"changed_sessions,omitempty"`
 	DeletedSessions        int    `json:"deleted_sessions,omitempty"`
 	Running                bool   `json:"running"`
@@ -78,7 +81,7 @@ func runIndexCommand(args []string) int {
 
 	switch args[0] {
 	case "refresh":
-		result, err := refreshIndex(manager)
+		result, err := refreshIndexWithOptions(manager, refreshOptions{ResolveCommits: cfg.ResolveCommits})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			return 1
@@ -86,6 +89,7 @@ func runIndexCommand(args []string) int {
 		fmt.Printf("Index refreshed.\n")
 		fmt.Printf("Indexed sessions: %d\n", result.IndexedSessions)
 		fmt.Printf("Indexed commit refs: %d\n", result.IndexedCommitRefs)
+		fmt.Printf("Full commit refs: %d\n", result.FullCommitRefs)
 		fmt.Printf("Changed sessions: %d\n", result.ChangedSessions)
 		fmt.Printf("Deleted sessions: %d\n", result.DeletedSessions)
 		fmt.Printf("Unchanged sessions: %d\n", result.UnchangedSessions)
@@ -101,6 +105,7 @@ func runIndexCommand(args []string) int {
 		fmt.Printf("Index storage: %s\n", manager.StorageDir)
 		fmt.Printf("Indexed sessions: %d\n", len(state.Sessions))
 		fmt.Printf("Indexed commit refs: %d\n", countIndexedCommitRefs(state))
+		fmt.Printf("Full commit refs: %d\n", countFullCommitRefs(state))
 		fmt.Printf("Updated at: %s\n", nonEmpty(state.UpdatedAt, "(never)"))
 		return 0
 	default:
@@ -127,9 +132,9 @@ func runDaemonCommand(args []string) int {
 
 	switch args[0] {
 	case "run":
-		return runDaemonLoop(manager, cfg.Interval)
+		return runDaemonLoop(manager, cfg.Interval, cfg.ResolveCommits)
 	case "install":
-		return installDaemon(manager, cfg.Interval)
+		return installDaemon(manager, cfg.Interval, cfg.ResolveCommits)
 	case "start":
 		return startDaemon(manager)
 	case "stop":
@@ -180,6 +185,8 @@ func parseDaemonCommandConfig(args []string) (daemonCommandConfig, error) {
 			}
 			cfg.Interval = interval
 			i = next
+		case "--resolve-commits":
+			cfg.ResolveCommits = true
 		default:
 			return cfg, fmt.Errorf("unknown flag: %s", args[i])
 		}
@@ -187,7 +194,7 @@ func parseDaemonCommandConfig(args []string) (daemonCommandConfig, error) {
 	return cfg, nil
 }
 
-func runDaemonLoop(manager indexManager, interval time.Duration) int {
+func runDaemonLoop(manager indexManager, interval time.Duration, resolveCommits bool) int {
 	if err := ensureIndexDirs(manager); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -197,12 +204,13 @@ func runDaemonLoop(manager indexManager, interval time.Duration) int {
 	defer stop()
 
 	status := daemonStatus{
-		Label:     manager.Label,
-		Root:      manager.Root,
-		Pid:       os.Getpid(),
-		Interval:  interval.String(),
-		StartedAt: time.Now().Format(time.RFC3339),
-		Running:   true,
+		Label:          manager.Label,
+		Root:           manager.Root,
+		Pid:            os.Getpid(),
+		Interval:       interval.String(),
+		StartedAt:      time.Now().Format(time.RFC3339),
+		ResolveCommits: resolveCommits,
+		Running:        true,
 	}
 	_ = writeJSONFileAtomic(manager.StatusPath, status)
 
@@ -212,13 +220,14 @@ func runDaemonLoop(manager indexManager, interval time.Duration) int {
 		status.LastRefreshStartedAt = time.Now().Format(time.RFC3339)
 		_ = writeJSONFileAtomic(manager.StatusPath, status)
 
-		result, err := refreshIndex(manager)
+		result, err := refreshIndexWithOptions(manager, refreshOptions{ResolveCommits: resolveCommits})
 		if err != nil {
 			status.LastError = err.Error()
 		} else {
 			status.LastError = ""
 			status.IndexedSessions = result.IndexedSessions
 			status.IndexedCommitRefs = result.IndexedCommitRefs
+			status.FullCommitRefs = result.FullCommitRefs
 			status.ChangedSessions = result.ChangedSessions
 			status.DeletedSessions = result.DeletedSessions
 			status.LastRefreshCompletedAt = result.UpdatedAt.Format(time.RFC3339)
@@ -243,7 +252,7 @@ func runDaemonLoop(manager indexManager, interval time.Duration) int {
 	}
 }
 
-func installDaemon(manager indexManager, interval time.Duration) int {
+func installDaemon(manager indexManager, interval time.Duration, resolveCommits bool) int {
 	if err := ensureDaemonPlatformSupported(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -253,7 +262,7 @@ func installDaemon(manager indexManager, interval time.Duration) int {
 		return 1
 	}
 
-	initial, err := refreshIndex(manager)
+	initial, err := refreshIndexWithOptions(manager, refreshOptions{ResolveCommits: resolveCommits})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: initial index refresh failed: %v\n", err)
 		return 1
@@ -266,9 +275,9 @@ func installDaemon(manager indexManager, interval time.Duration) int {
 	}
 	switch runtime.GOOS {
 	case "darwin":
-		return installLaunchdDaemon(manager, exe, interval, initial)
+		return installLaunchdDaemon(manager, exe, interval, resolveCommits, initial)
 	case "linux":
-		return installSystemdDaemon(manager, exe, interval, initial)
+		return installSystemdDaemon(manager, exe, interval, resolveCommits, initial)
 	default:
 		fmt.Fprintf(os.Stderr, "error: daemon management is not supported on %s\n", runtime.GOOS)
 		return 1
@@ -432,6 +441,7 @@ func printDaemonStatus(manager indexManager) int {
 	if status.Interval != "" {
 		fmt.Printf("Interval: %s\n", status.Interval)
 	}
+	fmt.Printf("Resolve commits: %t\n", status.ResolveCommits)
 	if status.StartedAt != "" {
 		fmt.Printf("Started at: %s\n", status.StartedAt)
 	}
@@ -444,14 +454,17 @@ func printDaemonStatus(manager indexManager) int {
 	if status.IndexedCommitRefs > 0 {
 		fmt.Printf("Indexed commit refs: %d\n", status.IndexedCommitRefs)
 	}
+	if status.FullCommitRefs > 0 {
+		fmt.Printf("Full commit refs: %d\n", status.FullCommitRefs)
+	}
 	if status.LastError != "" {
 		fmt.Printf("Last error: %s\n", status.LastError)
 	}
 	return 0
 }
 
-func installLaunchdDaemon(manager indexManager, executable string, interval time.Duration, initial refreshResult) int {
-	plist := buildLaunchAgentPlist(manager, executable, interval)
+func installLaunchdDaemon(manager indexManager, executable string, interval time.Duration, resolveCommits bool, initial refreshResult) int {
+	plist := buildLaunchAgentPlist(manager, executable, interval, resolveCommits)
 	if err := writeFileAtomic(manager.LaunchAgentPath, []byte(plist), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "error: write launch agent: %v\n", err)
 		return 1
@@ -473,12 +486,14 @@ func installLaunchdDaemon(manager indexManager, executable string, interval time
 	fmt.Printf("LaunchAgent: %s\n", manager.LaunchAgentPath)
 	fmt.Printf("Index storage: %s\n", manager.StorageDir)
 	fmt.Printf("Initial indexed sessions: %d\n", initial.IndexedSessions)
+	fmt.Printf("Initial full commit refs: %d\n", initial.FullCommitRefs)
 	fmt.Printf("Refresh interval: %s\n", interval)
+	fmt.Printf("Resolve commits: %t\n", resolveCommits)
 	return 0
 }
 
-func installSystemdDaemon(manager indexManager, executable string, interval time.Duration, initial refreshResult) int {
-	unit := buildSystemdUnit(manager, executable, interval)
+func installSystemdDaemon(manager indexManager, executable string, interval time.Duration, resolveCommits bool, initial refreshResult) int {
+	unit := buildSystemdUnit(manager, executable, interval, resolveCommits)
 	if err := writeFileAtomic(manager.SystemdUnitPath, []byte(unit), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "error: write systemd unit: %v\n", err)
 		return 1
@@ -504,11 +519,13 @@ func installSystemdDaemon(manager indexManager, executable string, interval time
 	fmt.Printf("Systemd unit: %s\n", manager.SystemdUnitPath)
 	fmt.Printf("Index storage: %s\n", manager.StorageDir)
 	fmt.Printf("Initial indexed sessions: %d\n", initial.IndexedSessions)
+	fmt.Printf("Initial full commit refs: %d\n", initial.FullCommitRefs)
 	fmt.Printf("Refresh interval: %s\n", interval)
+	fmt.Printf("Resolve commits: %t\n", resolveCommits)
 	return 0
 }
 
-func buildLaunchAgentPlist(manager indexManager, executable string, interval time.Duration) string {
+func buildLaunchAgentPlist(manager indexManager, executable string, interval time.Duration, resolveCommits bool) string {
 	args := []string{
 		executable,
 		"daemon",
@@ -517,6 +534,9 @@ func buildLaunchAgentPlist(manager indexManager, executable string, interval tim
 		manager.Root,
 		"--interval",
 		interval.String(),
+	}
+	if resolveCommits {
+		args = append(args, "--resolve-commits")
 	}
 
 	var argLines []string
@@ -549,7 +569,7 @@ func buildLaunchAgentPlist(manager indexManager, executable string, interval tim
 `, xmlEscape(manager.Label), strings.Join(argLines, "\n"), xmlEscape(manager.StorageDir), xmlEscape(manager.StdoutLogPath), xmlEscape(manager.StderrLogPath))
 }
 
-func buildSystemdUnit(manager indexManager, executable string, interval time.Duration) string {
+func buildSystemdUnit(manager indexManager, executable string, interval time.Duration, resolveCommits bool) string {
 	args := []string{
 		executable,
 		"daemon",
@@ -558,6 +578,9 @@ func buildSystemdUnit(manager indexManager, executable string, interval time.Dur
 		manager.Root,
 		"--interval",
 		interval.String(),
+	}
+	if resolveCommits {
+		args = append(args, "--resolve-commits")
 	}
 
 	var quotedArgs []string

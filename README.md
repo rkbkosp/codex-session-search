@@ -185,6 +185,7 @@ Flags:
 - `--view compact|full`: terminal output style, default `compact`
 - `--assistant-only`: shortcut for `--role assistant`
 - `--user-only`: shortcut for `--role user`
+- `--resolve-commits`: for `index refresh` and `daemon install/run`, resolve short hashes through local git repositories
 
 Notes:
 
@@ -213,6 +214,13 @@ Use a non-default Codex home:
 
 ```bash
 codex-session-search index refresh --root /path/to/.codex
+```
+
+Optionally resolve short commit hashes against local git repositories:
+
+```bash
+codex-session-search index refresh --resolve-commits
+codex-session-search daemon install --interval 15s --resolve-commits
 ```
 
 ### What The Index Stores
@@ -257,7 +265,15 @@ For each indexed hash, the commit index stores:
 - command text
 - source payload type
 
-The index deliberately does not run `git` against historical working directories during normal refresh. That keeps daemon indexing deterministic and avoids stale or missing local repository state. When only a short hash is present, `--commit` treats it as a prefix and may return multiple sessions if the prefix is not unique.
+By default, the index does not run `git` against historical working directories. That keeps daemon indexing deterministic and avoids stale or missing local repository state. When only a short hash is present, `--commit` treats it as a prefix and may return multiple sessions if the prefix is not unique.
+
+With `--resolve-commits`, refresh and daemon runs use the recorded command cwd, or the command's `git -C <path>` directory, to run:
+
+```bash
+git -C <repo> rev-parse <short-hash>^{commit}
+```
+
+If the local repository still exists and the short hash resolves unambiguously, the index stores the 40-character `full_hash`. If the repo moved, the object is unavailable, or the prefix is ambiguous, the index keeps the observed short hash and search still works by prefix.
 
 ## Background Daemon
 
@@ -270,6 +286,7 @@ The daemon continuously refreshes the lightweight index in the background.
 
 ```bash
 codex-session-search daemon install --interval 15s
+codex-session-search daemon install --interval 15s --resolve-commits
 ```
 
 This does three things:
