@@ -522,14 +522,28 @@ func (m tuiModel) renderResultList() string {
 		title := nonEmpty(res.Title, "(untitled session)")
 		title = shorten(title, cfg.Query, cfg.CaseSensitive, 90)
 		title = highlightText(title, cfg.Query, cfg.CaseSensitive, outputTheme{Color: true})
-		meta := compactMetaLine(res)
-		line := fmt.Sprintf("%3d  %s  %s  %s", i+1, res.ID, tuiDimStyle.Render(meta), title)
+		meta := tuiResultMetaLine(res)
+		if meta != "" {
+			meta = "  " + tuiDimStyle.Render(meta)
+		}
+		line := fmt.Sprintf("%3d  %s%s  %s", i+1, res.ID, meta, title)
 		if i == m.selected {
 			line = tuiSelectedStyle.Render(line)
 		}
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func tuiResultMetaLine(res result) string {
+	var parts []string
+	if res.Date != "" {
+		parts = append(parts, res.Date)
+	}
+	if res.CWD != "" {
+		parts = append(parts, pathTail(res.CWD))
+	}
+	return strings.Join(parts, " | ")
 }
 
 func (m tuiModel) resultListOffset(height int) int {
@@ -553,9 +567,6 @@ func (m tuiModel) renderPreview() string {
 	lines = append(lines, "command: "+launchCommandString(res.ID, m.launch))
 	if res.CWD != "" {
 		lines = append(lines, "cwd: "+res.CWD)
-	}
-	if res.Path != "" {
-		lines = append(lines, "file: "+res.Path)
 	}
 	lines = append(lines, "")
 

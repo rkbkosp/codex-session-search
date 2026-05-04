@@ -53,3 +53,44 @@ func TestLaunchCommandString(t *testing.T) {
 		t.Fatalf("app command = %q, want deep link", got)
 	}
 }
+
+func TestTUIResultListOmitsDuplicateIDAndHits(t *testing.T) {
+	model := newTUIModel("/tmp/codex", "SRT")
+	model.activeTerm = "SRT"
+	model.results = []result{{
+		ID:         "019df31b-37dd-7b42-b161-cabd94aaaed7",
+		Title:      "SRT cleanup",
+		Date:       "2026-05-04",
+		CWD:        "/repo/drama_workspace",
+		MatchCount: 30,
+	}}
+
+	view := model.renderResultList()
+	if strings.Contains(view, "019df31b-37dd...") {
+		t.Fatalf("result list contains truncated duplicate id: %q", view)
+	}
+	if strings.Contains(view, "hits:") {
+		t.Fatalf("result list contains hit count: %q", view)
+	}
+	if !strings.Contains(view, "019df31b-37dd-7b42-b161-cabd94aaaed7") {
+		t.Fatalf("result list omitted full id: %q", view)
+	}
+}
+
+func TestTUIPreviewOmitsSessionFilePath(t *testing.T) {
+	model := newTUIModel("/tmp/codex", "SRT")
+	model.activeTerm = "SRT"
+	model.results = []result{{
+		ID:    "019df31b-37dd-7b42-b161-cabd94aaaed7",
+		Title: "SRT cleanup",
+		Path:  "/Users/huangwei/.codex/sessions/2026/05/04/session.jsonl",
+		Snippets: []snippet{{
+			Match: message{Role: "user", Text: "fix SRT"},
+		}},
+	}}
+
+	view := model.renderPreview()
+	if strings.Contains(view, "file:") {
+		t.Fatalf("preview contains session file path: %q", view)
+	}
+}
