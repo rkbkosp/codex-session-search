@@ -18,3 +18,4 @@
 # Misc local artifacts
 *.log
 *.tmp
+.codex_logs/
