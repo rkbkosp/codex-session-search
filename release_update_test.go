@@ -120,6 +120,64 @@ func TestValidateVersionOutput(t *testing.T) {
 	}
 }
 
+func TestParseLaunchAgentExecutable(t *testing.T) {
+	manager := indexManager{
+		Label:         "com.example.codex-session-search.test",
+		Root:          "/tmp/codex root",
+		StorageDir:    "/tmp/codex storage",
+		StdoutLogPath: "/tmp/codex storage/out.log",
+		StderrLogPath: "/tmp/codex storage/err.log",
+	}
+	executable := "/Applications/Codex Session Search/codex-session-search"
+	plist := buildLaunchAgentPlist(manager, executable, time.Minute, true)
+	got, ok, err := parseLaunchAgentExecutable([]byte(plist))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("launch agent executable was not found")
+	}
+	if got != executable {
+		t.Fatalf("executable = %q, want %q", got, executable)
+	}
+}
+
+func TestParseSystemdExecStartExecutable(t *testing.T) {
+	manager := indexManager{
+		Root:          "/tmp/codex root",
+		StorageDir:    "/tmp/codex storage",
+		StdoutLogPath: "/tmp/codex storage/out.log",
+		StderrLogPath: "/tmp/codex storage/err.log",
+	}
+	executable := "/opt/Codex Session Search/codex-session-search"
+	unit := buildSystemdUnit(manager, executable, time.Minute, true)
+	got, ok, err := parseSystemdExecStartExecutable([]byte(unit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("systemd executable was not found")
+	}
+	if got != executable {
+		t.Fatalf("executable = %q, want %q", got, executable)
+	}
+}
+
+func TestSameExecutablePathResolvesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "link")
+	if err := os.WriteFile(target, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if !sameExecutablePath(link, target) {
+		t.Fatalf("expected %q and %q to resolve to the same executable", link, target)
+	}
+}
+
 func TestShouldSkipRecentFailedUpdate(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if err := saveUpdateState(updateState{

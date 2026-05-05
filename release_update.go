@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -281,7 +283,7 @@ func applyReleaseUpdate(ctx context.Context, repo, tag string) (updateApplyResul
 		return updateApplyResult{}, err
 	}
 	result := updateApplyResult{Applied: true}
-	restarted, restartErr := restartRunningDaemon()
+	restarted, restartErr := restartRunningDaemon(exe)
 	result.DaemonRestarted = restarted
 	if restartErr != nil {
 		result.DaemonRestartError = restartErr.Error()
@@ -509,7 +511,7 @@ func validateVersionOutput(output, tag string) error {
 	return nil
 }
 
-func restartRunningDaemon() (bool, error) {
+func restartRunningDaemon(updatedExecutable string) (bool, error) {
 	root, err := expandPath(defaultRoot)
 	if err != nil {
 		return false, err
@@ -527,6 +529,9 @@ func restartRunningDaemon() (bool, error) {
 		if !loaded {
 			return false, nil
 		}
+		if err := verifyDaemonExecutableMatches(manager, updatedExecutable); err != nil {
+			return false, err
+		}
 		if err := kickstartLaunchdDaemon(manager); err != nil {
 			return false, err
 		}
@@ -542,6 +547,9 @@ func restartRunningDaemon() (bool, error) {
 		if status.ActiveState != "active" {
 			return false, nil
 		}
+		if err := verifyDaemonExecutableMatches(manager, updatedExecutable); err != nil {
+			return false, err
+		}
 		if err := runSystemctlUser("restart", systemdUnitName(manager)); err != nil {
 			return false, err
 		}
@@ -549,6 +557,142 @@ func restartRunningDaemon() (bool, error) {
 	default:
 		return false, nil
 	}
+}
+
+func verifyDaemonExecutableMatches(manager indexManager, updatedExecutable string) error {
+	configured, ok, err := configuredDaemonExecutable(manager)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("daemon executable path was not found in service configuration")
+	}
+	if sameExecutablePath(configured, updatedExecutable) {
+		return nil
+	}
+	return fmt.Errorf("daemon executable %s does not match updated binary %s; run `codex-session-search daemon install` from the installed binary to refresh daemon configuration", configured, updatedExecutable)
+}
+
+func configuredDaemonExecutable(manager indexManager) (string, bool, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		data, err := os.ReadFile(manager.LaunchAgentPath)
+		if err != nil {
+			return "", false, err
+		}
+		return parseLaunchAgentExecutable(data)
+	case "linux":
+		data, err := os.ReadFile(manager.SystemdUnitPath)
+		if err != nil {
+			return "", false, err
+		}
+		return parseSystemdExecStartExecutable(data)
+	default:
+		return "", false, nil
+	}
+}
+
+func parseLaunchAgentExecutable(data []byte) (string, bool, error) {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	wantProgramArgs := false
+	inProgramArgs := false
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			return "", false, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		switch typed := token.(type) {
+		case xml.StartElement:
+			switch typed.Name.Local {
+			case "key":
+				var key string
+				if err := decoder.DecodeElement(&key, &typed); err != nil {
+					return "", false, err
+				}
+				wantProgramArgs = strings.TrimSpace(key) == "ProgramArguments"
+			case "array":
+				if wantProgramArgs {
+					inProgramArgs = true
+					wantProgramArgs = false
+				}
+			case "string":
+				if inProgramArgs {
+					var value string
+					if err := decoder.DecodeElement(&value, &typed); err != nil {
+						return "", false, err
+					}
+					return value, value != "", nil
+				}
+			}
+		case xml.EndElement:
+			if typed.Name.Local == "array" && inProgramArgs {
+				return "", false, nil
+			}
+		}
+	}
+}
+
+func parseSystemdExecStartExecutable(data []byte) (string, bool, error) {
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || key != "ExecStart" {
+			continue
+		}
+		return firstSystemdExecArg(strings.TrimSpace(value))
+	}
+	return "", false, nil
+}
+
+func firstSystemdExecArg(value string) (string, bool, error) {
+	if value == "" {
+		return "", false, nil
+	}
+	if value[0] != '"' {
+		fields := strings.Fields(value)
+		if len(fields) == 0 {
+			return "", false, nil
+		}
+		return fields[0], true, nil
+	}
+	escaped := false
+	for i := 1; i < len(value); i++ {
+		ch := value[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			arg, err := strconv.Unquote(value[:i+1])
+			if err != nil {
+				return "", false, err
+			}
+			return arg, true, nil
+		}
+	}
+	return "", false, errors.New("unterminated quoted ExecStart executable")
+}
+
+func sameExecutablePath(left, right string) bool {
+	left = mustAbs(left)
+	right = mustAbs(right)
+	if resolved, err := filepath.EvalSymlinks(left); err == nil {
+		left = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(right); err == nil {
+		right = resolved
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
 }
 
 func compareVersions(current, latest string) int {
