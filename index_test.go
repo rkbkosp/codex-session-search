@@ -219,6 +219,81 @@ func TestSearchCommitsWithIndex(t *testing.T) {
 	}
 }
 
+func TestRefreshIndexReportsProgress(t *testing.T) {
+	temp := t.TempDir()
+	root := filepath.Join(temp, "codex")
+	sessionDir := filepath.Join(root, "sessions", "2026", "05", "04")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionPath := filepath.Join(sessionDir, "rollout-2026-05-04T10-00-00-019df31b-37dd-7b42-b161-cabd94aaaed7.jsonl")
+	lines := []string{
+		jsonLine(t, eventEnvelope{
+			Timestamp: "2026-05-04T02:00:00Z",
+			Type:      "session_meta",
+			Payload: mustRawJSON(t, sessionMeta{
+				ID:        "019df31b-37dd-7b42-b161-cabd94aaaed7",
+				Timestamp: "2026-05-04T02:00:00Z",
+				CWD:       "/repo",
+			}),
+		}),
+	}
+	if err := os.WriteFile(sessionPath, []byte(joinLines(lines)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	storage := filepath.Join(temp, "runtime")
+	manager := indexManager{
+		Root:        root,
+		StorageDir:  storage,
+		SessionsDir: filepath.Join(storage, "sessions"),
+		CommitsDir:  filepath.Join(storage, "commits"),
+		StatePath:   filepath.Join(storage, "state.json"),
+	}
+	var progress []refreshProgress
+	if _, err := refreshIndexWithOptions(manager, refreshOptions{
+		ResolveCommits: false,
+		Progress: func(event refreshProgress) {
+			progress = append(progress, event)
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(progress) == 0 {
+		t.Fatal("expected progress events")
+	}
+	if !progressIncludesStage(progress, refreshStageLoadState) {
+		t.Fatal("missing load-state progress event")
+	}
+	if !progressIncludesStage(progress, refreshStageWriteLookup) {
+		t.Fatal("missing write-lookup progress event")
+	}
+	if progress[len(progress)-1].Stage != refreshStageComplete {
+		t.Fatalf("last progress stage = %q, want %q", progress[len(progress)-1].Stage, refreshStageComplete)
+	}
+	if !progressIncludesScan(progress, 1, 1) {
+		t.Fatalf("missing final scan progress event: %#v", progress)
+	}
+}
+
+func progressIncludesStage(progress []refreshProgress, stage string) bool {
+	for _, event := range progress {
+		if event.Stage == stage {
+			return true
+		}
+	}
+	return false
+}
+
+func progressIncludesScan(progress []refreshProgress, current, total int) bool {
+	for _, event := range progress {
+		if event.Stage == refreshStageScanSessions && event.Current == current && event.Total == total {
+			return true
+		}
+	}
+	return false
+}
+
 func run(t *testing.T, dir string, name string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command(name, args...)

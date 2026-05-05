@@ -79,7 +79,25 @@ type refreshResult struct {
 
 type refreshOptions struct {
 	ResolveCommits bool
+	Progress       func(refreshProgress)
 }
+
+type refreshProgress struct {
+	Stage   string
+	Current int
+	Total   int
+}
+
+const (
+	refreshStageLoadState       = "load_state"
+	refreshStageLoadSessionInfo = "load_session_info"
+	refreshStageCollectSessions = "collect_sessions"
+	refreshStageScanSessions    = "scan_sessions"
+	refreshStagePruneDeleted    = "prune_deleted"
+	refreshStageWriteLookup     = "write_lookup"
+	refreshStageSaveState       = "save_state"
+	refreshStageComplete        = "complete"
+)
 
 type indexedCommitRef struct {
 	SessionID  string `json:"session_id"`
@@ -187,16 +205,19 @@ func refreshIndexWithOptions(manager indexManager, options refreshOptions) (refr
 		return refreshResult{}, err
 	}
 
+	emitRefreshProgress(options, refreshProgress{Stage: refreshStageLoadState})
 	state, err := loadIndexState(manager)
 	if err != nil {
 		return refreshResult{}, err
 	}
 
+	emitRefreshProgress(options, refreshProgress{Stage: refreshStageLoadSessionInfo})
 	threadIndex, err := loadSessionIndex(filepath.Join(manager.Root, "session_index.jsonl"))
 	if err != nil {
 		return refreshResult{}, err
 	}
 
+	emitRefreshProgress(options, refreshProgress{Stage: refreshStageCollectSessions})
 	files, err := collectSessionFiles(filepath.Join(manager.Root, "sessions"), "", "", time.Time{}, time.Time{})
 	if err != nil {
 		return refreshResult{}, err
@@ -204,7 +225,8 @@ func refreshIndexWithOptions(manager indexManager, options refreshOptions) (refr
 
 	current := make(map[string]sessionFile, len(files))
 	result := refreshResult{}
-	for _, file := range files {
+	emitRefreshProgress(options, refreshProgress{Stage: refreshStageScanSessions, Current: 0, Total: len(files)})
+	for i, file := range files {
 		current[file.Path] = file
 
 		info, err := os.Stat(file.Path)
@@ -222,6 +244,9 @@ func refreshIndexWithOptions(manager indexManager, options refreshOptions) (refr
 			fileExists(filepath.Join(manager.StorageDir, prev.CommitIndexFile)) &&
 			fileExists(filepath.Join(manager.StorageDir, prev.IndexFile)) {
 			result.UnchangedSessions++
+			if shouldEmitRefreshScanProgress(i+1, len(files)) {
+				emitRefreshProgress(options, refreshProgress{Stage: refreshStageScanSessions, Current: i + 1, Total: len(files)})
+			}
 			continue
 		}
 
@@ -252,8 +277,12 @@ func refreshIndexWithOptions(manager indexManager, options refreshOptions) (refr
 
 		state.Sessions[file.Path] = meta
 		result.ChangedSessions++
+		if shouldEmitRefreshScanProgress(i+1, len(files)) {
+			emitRefreshProgress(options, refreshProgress{Stage: refreshStageScanSessions, Current: i + 1, Total: len(files)})
+		}
 	}
 
+	emitRefreshProgress(options, refreshProgress{Stage: refreshStagePruneDeleted})
 	for sourcePath, meta := range state.Sessions {
 		if _, ok := current[sourcePath]; ok {
 			continue
@@ -273,13 +302,26 @@ func refreshIndexWithOptions(manager indexManager, options refreshOptions) (refr
 	result.FullCommitRefs = countFullCommitRefs(state)
 	result.UpdatedAt = time.Now()
 	state.UpdatedAt = result.UpdatedAt.Format(time.RFC3339)
+	emitRefreshProgress(options, refreshProgress{Stage: refreshStageWriteLookup})
 	if err := writeCommitLookup(manager, state); err != nil {
 		return refreshResult{}, err
 	}
+	emitRefreshProgress(options, refreshProgress{Stage: refreshStageSaveState})
 	if err := saveIndexState(manager, state); err != nil {
 		return refreshResult{}, err
 	}
+	emitRefreshProgress(options, refreshProgress{Stage: refreshStageComplete, Current: result.IndexedSessions, Total: result.IndexedSessions})
 	return result, nil
+}
+
+func emitRefreshProgress(options refreshOptions, progress refreshProgress) {
+	if options.Progress != nil {
+		options.Progress(progress)
+	}
+}
+
+func shouldEmitRefreshScanProgress(current, total int) bool {
+	return total == 0 || current == 1 || current == total || current%50 == 0
 }
 
 func extractIndexedSession(file sessionFile, threadIndex map[string]indexEntry) (indexedSessionMeta, []message, []commitMatch, error) {
@@ -480,12 +522,16 @@ func sortedIndexedSessionMetas(state indexState) []indexedSessionMeta {
 }
 
 func searchWithIndex(manager indexManager, cfg config) ([]result, []string, int, error) {
+	return searchWithIndexWithRefreshOptions(manager, cfg, refreshOptions{ResolveCommits: true})
+}
+
+func searchWithIndexWithRefreshOptions(manager indexManager, cfg config, options refreshOptions) ([]result, []string, int, error) {
 	state, err := loadIndexState(manager)
 	if err != nil {
 		return nil, nil, 0, err
 	}
 	if len(state.Sessions) == 0 {
-		if _, err := refreshIndex(manager); err != nil {
+		if _, err := refreshIndexWithOptions(manager, options); err != nil {
 			return nil, nil, 0, err
 		}
 		state, err = loadIndexState(manager)
@@ -511,12 +557,16 @@ func searchWithIndex(manager indexManager, cfg config) ([]result, []string, int,
 }
 
 func searchCommitsWithIndex(manager indexManager, cfg config) ([]result, []string, int, error) {
+	return searchCommitsWithIndexWithRefreshOptions(manager, cfg, refreshOptions{ResolveCommits: true})
+}
+
+func searchCommitsWithIndexWithRefreshOptions(manager indexManager, cfg config, options refreshOptions) ([]result, []string, int, error) {
 	state, err := loadIndexState(manager)
 	if err != nil {
 		return nil, nil, 0, err
 	}
 	if len(state.Sessions) == 0 || !commitLookupReady(manager, state) {
-		if _, err := refreshIndex(manager); err != nil {
+		if _, err := refreshIndexWithOptions(manager, options); err != nil {
 			return nil, nil, 0, err
 		}
 		state, err = loadIndexState(manager)

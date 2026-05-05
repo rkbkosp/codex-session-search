@@ -83,7 +83,11 @@ func runIndexCommand(args []string) int {
 
 	switch args[0] {
 	case "refresh":
-		result, err := refreshIndexWithOptions(manager, refreshOptions{ResolveCommits: cfg.ResolveCommits})
+		fmt.Fprintf(os.Stderr, "Refreshing index for %s. This can take a while on the first run.\n", manager.Root)
+		result, err := refreshIndexWithOptions(manager, refreshOptions{
+			ResolveCommits: cfg.ResolveCommits,
+			Progress:       newRefreshProgressPrinter(os.Stderr),
+		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			return 1
@@ -113,6 +117,35 @@ func runIndexCommand(args []string) int {
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown index subcommand: %s\n", args[0])
 		return 2
+	}
+}
+
+func newRefreshProgressPrinter(out *os.File) func(refreshProgress) {
+	return func(progress refreshProgress) {
+		switch progress.Stage {
+		case refreshStageLoadState:
+			fmt.Fprintln(out, "Index refresh: loading existing index state...")
+		case refreshStageLoadSessionInfo:
+			fmt.Fprintln(out, "Index refresh: loading session metadata...")
+		case refreshStageCollectSessions:
+			fmt.Fprintln(out, "Index refresh: collecting session files...")
+		case refreshStageScanSessions:
+			if progress.Total == 0 {
+				fmt.Fprintln(out, "Index refresh: no session files to scan.")
+			} else if progress.Current == 0 {
+				fmt.Fprintf(out, "Index refresh: scanning %d session files...\n", progress.Total)
+			} else {
+				fmt.Fprintf(out, "Index refresh: scanned %d/%d session files...\n", progress.Current, progress.Total)
+			}
+		case refreshStagePruneDeleted:
+			fmt.Fprintln(out, "Index refresh: pruning deleted sessions...")
+		case refreshStageWriteLookup:
+			fmt.Fprintln(out, "Index refresh: writing commit lookup index...")
+		case refreshStageSaveState:
+			fmt.Fprintln(out, "Index refresh: saving index state...")
+		case refreshStageComplete:
+			fmt.Fprintf(out, "Index refresh: complete, %d sessions indexed.\n", progress.Current)
+		}
 	}
 }
 
@@ -265,7 +298,11 @@ func installDaemon(manager indexManager, interval time.Duration, resolveCommits 
 		return 1
 	}
 
-	initial, err := refreshIndexWithOptions(manager, refreshOptions{ResolveCommits: resolveCommits})
+	fmt.Fprintf(os.Stderr, "Refreshing index before installing daemon for %s. This can take a while on the first run.\n", manager.Root)
+	initial, err := refreshIndexWithOptions(manager, refreshOptions{
+		ResolveCommits: resolveCommits,
+		Progress:       newRefreshProgressPrinter(os.Stderr),
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: initial index refresh failed: %v\n", err)
 		return 1

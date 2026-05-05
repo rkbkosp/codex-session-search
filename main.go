@@ -226,10 +226,14 @@ func runIndexedSearch(cfg config) (int, bool) {
 	var results []result
 	var warnings []string
 	var scanned int
+	searchRefreshOptions := refreshOptions{
+		ResolveCommits: true,
+		Progress:       newRefreshProgressPrinter(os.Stderr),
+	}
 	if cfg.CommitQuery != "" {
-		results, warnings, scanned, err = searchCommitsWithIndex(manager, cfg)
+		results, warnings, scanned, err = searchCommitsWithIndexWithRefreshOptions(manager, cfg, searchRefreshOptions)
 	} else {
-		results, warnings, scanned, err = searchWithIndex(manager, cfg)
+		results, warnings, scanned, err = searchWithIndexWithRefreshOptions(manager, cfg, searchRefreshOptions)
 	}
 	if err != nil {
 		if cfg.CommitQuery != "" {
