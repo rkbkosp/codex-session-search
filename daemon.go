@@ -155,8 +155,9 @@ func parseDaemonCommandConfig(args []string) (daemonCommandConfig, error) {
 		return daemonCommandConfig{}, err
 	}
 	cfg := daemonCommandConfig{
-		Root:     root,
-		Interval: defaultDaemonInterval,
+		Root:           root,
+		Interval:       defaultDaemonInterval,
+		ResolveCommits: true,
 	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {

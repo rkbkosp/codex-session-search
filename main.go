@@ -1479,7 +1479,7 @@ func printUsage(out *os.File) {
 	fmt.Fprintln(out, "  --view VALUE          compact | full (default compact)")
 	fmt.Fprintln(out, "  --assistant-only      Shortcut for --role assistant")
 	fmt.Fprintln(out, "  --user-only           Shortcut for --role user")
-	fmt.Fprintln(out, "  --resolve-commits    For index/daemon commands, resolve short commit hashes via local git repos")
+	fmt.Fprintln(out, "  --resolve-commits    Accepted for index/daemon commands; commit resolution is enabled by default")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Examples:")
 	fmt.Fprintln(out, "  codex-session-search")
@@ -1492,7 +1492,6 @@ func printUsage(out *os.File) {
 	fmt.Fprintln(out, "  codex-session-search --view full --limit 5 \"drama_workspace\"")
 	fmt.Fprintln(out, "  codex-session-search --from 2026-04-01 --to 2026-04-20 \"renderwarden\"")
 	fmt.Fprintln(out, "  codex-session-search --on 2026-04-20 --limit 5 \"SRT\"")
-	fmt.Fprintln(out, "  codex-session-search index refresh --resolve-commits")
+	fmt.Fprintln(out, "  codex-session-search index refresh")
 	fmt.Fprintln(out, "  codex-session-search daemon install --interval 15s")
-	fmt.Fprintln(out, "  codex-session-search daemon install --interval 15s --resolve-commits")
 }

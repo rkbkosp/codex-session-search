@@ -17,26 +17,29 @@ import (
 	"time"
 )
 
-const indexVersion = 2
+const indexVersion = 3
 const commitResolveTimeout = 2 * time.Second
+const commitLookupFileName = "commit_lookup.jsonl"
 
 var (
 	wholeCommitHashPattern   = regexp.MustCompile(`(?i)^[0-9a-f]{4,40}$`)
 	leadingCommitHashPattern = regexp.MustCompile(`(?i)^([0-9a-f]{4,40})(?:\s|$)`)
+	commitHashTokenPattern   = regexp.MustCompile(`(?i)\b[0-9a-f]{7,40}\b`)
 )
 
 type indexManager struct {
-	Root            string
-	StorageDir      string
-	SessionsDir     string
-	CommitsDir      string
-	StatePath       string
-	StatusPath      string
-	StdoutLogPath   string
-	StderrLogPath   string
-	LaunchAgentPath string
-	SystemdUnitPath string
-	Label           string
+	Root             string
+	StorageDir       string
+	SessionsDir      string
+	CommitsDir       string
+	CommitLookupPath string
+	StatePath        string
+	StatusPath       string
+	StdoutLogPath    string
+	StderrLogPath    string
+	LaunchAgentPath  string
+	SystemdUnitPath  string
+	Label            string
 }
 
 type indexState struct {
@@ -78,6 +81,30 @@ type refreshOptions struct {
 	ResolveCommits bool
 }
 
+type indexedCommitRef struct {
+	SessionID  string `json:"session_id"`
+	SourcePath string `json:"source_path"`
+	Hash       string `json:"hash"`
+	FullHash   string `json:"full_hash,omitempty"`
+	Timestamp  string `json:"timestamp,omitempty"`
+	CWD        string `json:"cwd,omitempty"`
+	Command    string `json:"command,omitempty"`
+	Source     string `json:"source,omitempty"`
+	CallID     string `json:"call_id,omitempty"`
+}
+
+func (ref indexedCommitRef) commitMatch() commitMatch {
+	return commitMatch{
+		Hash:      ref.Hash,
+		FullHash:  ref.FullHash,
+		Timestamp: ref.Timestamp,
+		CWD:       ref.CWD,
+		Command:   ref.Command,
+		Source:    ref.Source,
+		CallID:    ref.CallID,
+	}
+}
+
 func newIndexManager(root string) (indexManager, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -87,17 +114,18 @@ func newIndexManager(root string) (indexManager, error) {
 	storageDir := filepath.Join(home, ".local", "share", "codex-session-search", "runtime", hash)
 	label := "com.huangwei.codex-session-search." + hash
 	return indexManager{
-		Root:            root,
-		StorageDir:      storageDir,
-		SessionsDir:     filepath.Join(storageDir, "sessions"),
-		CommitsDir:      filepath.Join(storageDir, "commits"),
-		StatePath:       filepath.Join(storageDir, "state.json"),
-		StatusPath:      filepath.Join(storageDir, "daemon-status.json"),
-		StdoutLogPath:   filepath.Join(storageDir, "daemon.stdout.log"),
-		StderrLogPath:   filepath.Join(storageDir, "daemon.stderr.log"),
-		LaunchAgentPath: filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
-		SystemdUnitPath: filepath.Join(home, ".config", "systemd", "user", label+".service"),
-		Label:           label,
+		Root:             root,
+		StorageDir:       storageDir,
+		SessionsDir:      filepath.Join(storageDir, "sessions"),
+		CommitsDir:       filepath.Join(storageDir, "commits"),
+		CommitLookupPath: filepath.Join(storageDir, commitLookupFileName),
+		StatePath:        filepath.Join(storageDir, "state.json"),
+		StatusPath:       filepath.Join(storageDir, "daemon-status.json"),
+		StdoutLogPath:    filepath.Join(storageDir, "daemon.stdout.log"),
+		StderrLogPath:    filepath.Join(storageDir, "daemon.stderr.log"),
+		LaunchAgentPath:  filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
+		SystemdUnitPath:  filepath.Join(home, ".config", "systemd", "user", label+".service"),
+		Label:            label,
 	}, nil
 }
 
@@ -151,7 +179,7 @@ func saveIndexState(manager indexManager, state indexState) error {
 }
 
 func refreshIndex(manager indexManager) (refreshResult, error) {
-	return refreshIndexWithOptions(manager, refreshOptions{})
+	return refreshIndexWithOptions(manager, refreshOptions{ResolveCommits: true})
 }
 
 func refreshIndexWithOptions(manager indexManager, options refreshOptions) (refreshResult, error) {
@@ -245,6 +273,9 @@ func refreshIndexWithOptions(manager indexManager, options refreshOptions) (refr
 	result.FullCommitRefs = countFullCommitRefs(state)
 	result.UpdatedAt = time.Now()
 	state.UpdatedAt = result.UpdatedAt.Format(time.RFC3339)
+	if err := writeCommitLookup(manager, state); err != nil {
+		return refreshResult{}, err
+	}
 	if err := saveIndexState(manager, state); err != nil {
 		return refreshResult{}, err
 	}
@@ -328,6 +359,7 @@ func extractIndexedSession(file sessionFile, threadIndex map[string]indexEntry) 
 	}
 
 	meta.MessageCount = len(messages)
+	commitRefs = append(commitRefs, extractCommitRefsFromAssistantMessages(messages, meta.CWD)...)
 	commitRefs = dedupeCommitMatches(commitRefs)
 	meta.CommitCount = len(commitRefs)
 	if meta.Title == "" && len(messages) > 0 {
@@ -356,6 +388,95 @@ func writeIndexedCommits(path string, matches []commitMatch) error {
 		}
 	}
 	return writeFileAtomic(path, buf.Bytes(), 0o644)
+}
+
+func writeCommitLookup(manager indexManager, state indexState) error {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	metas := sortedIndexedSessionMetas(state)
+	for _, meta := range metas {
+		matches, err := loadIndexedCommits(manager, meta)
+		if err != nil {
+			return err
+		}
+		for _, match := range matches {
+			ref := indexedCommitRef{
+				SessionID:  meta.SessionID,
+				SourcePath: meta.SourcePath,
+				Hash:       match.Hash,
+				FullHash:   match.FullHash,
+				Timestamp:  match.Timestamp,
+				CWD:        match.CWD,
+				Command:    match.Command,
+				Source:     match.Source,
+				CallID:     match.CallID,
+			}
+			if err := enc.Encode(ref); err != nil {
+				return err
+			}
+		}
+	}
+	return writeFileAtomic(commitLookupPath(manager), buf.Bytes(), 0o644)
+}
+
+func loadCommitLookup(manager indexManager) ([]indexedCommitRef, error) {
+	handle, err := os.Open(commitLookupPath(manager))
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
+
+	var refs []indexedCommitRef
+	scanner := bufio.NewScanner(handle)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxScannerLineBytes)
+	for scanner.Scan() {
+		var ref indexedCommitRef
+		if err := json.Unmarshal(scanner.Bytes(), &ref); err != nil {
+			continue
+		}
+		if ref.SourcePath == "" || ref.Hash == "" {
+			continue
+		}
+		refs = append(refs, ref)
+	}
+	return refs, scanner.Err()
+}
+
+func loadIndexedCommits(manager indexManager, meta indexedSessionMeta) ([]commitMatch, error) {
+	if meta.CommitIndexFile == "" {
+		return nil, nil
+	}
+	handle, err := os.Open(filepath.Join(manager.StorageDir, meta.CommitIndexFile))
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
+
+	var matches []commitMatch
+	scanner := bufio.NewScanner(handle)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxScannerLineBytes)
+	for scanner.Scan() {
+		var match commitMatch
+		if err := json.Unmarshal(scanner.Bytes(), &match); err != nil {
+			continue
+		}
+		if match.Hash == "" {
+			continue
+		}
+		matches = append(matches, match)
+	}
+	return matches, scanner.Err()
+}
+
+func sortedIndexedSessionMetas(state indexState) []indexedSessionMeta {
+	metas := make([]indexedSessionMeta, 0, len(state.Sessions))
+	for _, meta := range state.Sessions {
+		metas = append(metas, meta)
+	}
+	sort.Slice(metas, func(i, j int) bool {
+		return metas[i].SourcePath < metas[j].SourcePath
+	})
+	return metas
 }
 
 func searchWithIndex(manager indexManager, cfg config) ([]result, []string, int, error) {
@@ -394,7 +515,7 @@ func searchCommitsWithIndex(manager indexManager, cfg config) ([]result, []strin
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	if len(state.Sessions) == 0 || !commitIndexReady(manager, state) {
+	if len(state.Sessions) == 0 || !commitLookupReady(manager, state) {
 		if _, err := refreshIndex(manager); err != nil {
 			return nil, nil, 0, err
 		}
@@ -405,19 +526,46 @@ func searchCommitsWithIndex(manager indexManager, cfg config) ([]result, []strin
 	}
 
 	candidates := filterIndexedSessions(state, cfg)
-	results := make([]result, 0, len(candidates))
-	var warnings []string
+	candidateByPath := make(map[string]indexedSessionMeta, len(candidates))
 	for _, meta := range candidates {
-		res, err := searchIndexedSessionCommits(manager, meta, cfg)
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("%s: %v", meta.SourcePath, err))
+		candidateByPath[meta.SourcePath] = meta
+	}
+
+	refs, err := loadCommitLookup(manager)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	resultIndexByPath := make(map[string]int)
+	results := make([]result, 0)
+	for _, ref := range refs {
+		meta, ok := candidateByPath[ref.SourcePath]
+		if !ok {
 			continue
 		}
-		if res != nil {
-			results = append(results, *res)
+		match := ref.commitMatch()
+		if !commitMatchHasQuery(match, cfg.CommitQuery) {
+			continue
 		}
+		idx, ok := resultIndexByPath[ref.SourcePath]
+		if !ok {
+			results = append(results, result{
+				ID:            meta.SessionID,
+				Title:         meta.Title,
+				UpdatedAt:     meta.UpdatedAt,
+				Date:          meta.Date,
+				StartedAt:     meta.StartedAt,
+				CWD:           meta.CWD,
+				Path:          meta.SourcePath,
+				Resume:        "codex resume " + meta.SessionID,
+				CommitMatched: true,
+			})
+			idx = len(results) - 1
+			resultIndexByPath[ref.SourcePath] = idx
+		}
+		results[idx].MatchCount++
+		results[idx].CommitMatches = append(results[idx].CommitMatches, match)
 	}
-	return results, warnings, len(candidates), nil
+	return results, nil, len(candidates), nil
 }
 
 func filterIndexedSessions(state indexState, cfg config) []indexedSessionMeta {
@@ -749,6 +897,70 @@ func buildCommitMatches(ctx commitCommandContext, output, source string) []commi
 	return matches
 }
 
+func extractCommitRefsFromAssistantMessages(messages []message, cwd string) []commitMatch {
+	var matches []commitMatch
+	for _, msg := range messages {
+		if msg.Role != "assistant" || !assistantTextMayContainCommitHash(msg.Text) {
+			continue
+		}
+		for _, hash := range extractCommitHashTokens(msg.Text) {
+			match := commitMatch{
+				Hash:      hash,
+				Timestamp: msg.Timestamp,
+				CWD:       cwd,
+				Source:    "assistant_message",
+			}
+			if len(hash) == 40 {
+				match.FullHash = hash
+			}
+			matches = append(matches, match)
+		}
+	}
+	return matches
+}
+
+func assistantTextMayContainCommitHash(text string) bool {
+	if wholeCommitHashPattern.MatchString(strings.TrimSpace(text)) {
+		return true
+	}
+	lower := strings.ToLower(text)
+	markers := []string{
+		"commit",
+		"git",
+		"hash",
+		"head",
+		"rev-parse",
+		"提交",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractCommitHashTokens(text string) []string {
+	var hashes []string
+	seen := make(map[string]bool)
+	for _, pair := range commitHashTokenPattern.FindAllStringIndex(text, -1) {
+		if commitTokenTouchesHyphen(text, pair[0], pair[1]) {
+			continue
+		}
+		hash := strings.ToLower(text[pair[0]:pair[1]])
+		if seen[hash] {
+			continue
+		}
+		seen[hash] = true
+		hashes = append(hashes, hash)
+	}
+	return hashes
+}
+
+func commitTokenTouchesHyphen(text string, start, end int) bool {
+	return (start > 0 && text[start-1] == '-') || (end < len(text) && text[end] == '-')
+}
+
 func resolveCommitFullHashes(matches []commitMatch) []commitMatch {
 	if len(matches) == 0 {
 		return matches
@@ -939,6 +1151,10 @@ func commitIndexReady(manager indexManager, state indexState) bool {
 	return true
 }
 
+func commitLookupReady(manager indexManager, state indexState) bool {
+	return commitIndexReady(manager, state) && fileExists(commitLookupPath(manager))
+}
+
 func countIndexedCommitRefs(state indexState) int {
 	total := 0
 	for _, meta := range state.Sessions {
@@ -982,6 +1198,13 @@ func shortHash(value string) string {
 
 func indexFileName(sourcePath string) string {
 	return shortHash(sourcePath) + ".jsonl"
+}
+
+func commitLookupPath(manager indexManager) string {
+	if manager.CommitLookupPath != "" {
+		return manager.CommitLookupPath
+	}
+	return filepath.Join(manager.StorageDir, commitLookupFileName)
 }
 
 func fileExists(path string) bool {

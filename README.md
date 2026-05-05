@@ -213,7 +213,7 @@ Flags:
 - `--view compact|full`: terminal output style, default `compact`
 - `--assistant-only`: shortcut for `--role assistant`
 - `--user-only`: shortcut for `--role user`
-- `--resolve-commits`: for `index refresh` and `daemon install/run`, resolve short hashes through local git repositories
+- `--resolve-commits`: accepted for `index refresh` and `daemon install/run`; commit resolution is enabled by default
 
 Notes:
 
@@ -221,7 +221,7 @@ Notes:
 - `--limit` only controls output size, not how many candidate sessions are evaluated
 - Search prefers the lightweight index; if indexed search cannot be used, the code still retains a raw-scan fallback path
 - `--commit` is a separate search mode and cannot be combined with a text query
-- Short hashes are matched as prefixes. If a session only contains `git rev-parse --short HEAD` output, the index cannot reconstruct the full 40-character hash from JSONL alone.
+- Short hashes and full hashes are both searchable. During indexing, short hashes are resolved to full hashes through the recorded local repository when possible.
 - ANSI color/highlighting is enabled only when writing to an interactive terminal
 - `--commit` and plain query arguments still search the same data, but the bare query path now opens the TUI instead of printing results directly
 
@@ -245,11 +245,11 @@ Use a non-default Codex home:
 codex-session-search index refresh --root /path/to/.codex
 ```
 
-Optionally resolve short commit hashes against local git repositories:
+Commit hashes are resolved against local git repositories by default:
 
 ```bash
-codex-session-search index refresh --resolve-commits
-codex-session-search daemon install --interval 15s --resolve-commits
+codex-session-search index refresh
+codex-session-search daemon install --interval 15s
 ```
 
 ### What The Index Stores
@@ -274,7 +274,7 @@ It does not duplicate:
 
 ### Git Commit-Hash Index
 
-The index also stores commit hashes returned by git-related tool calls in a separate per-session index under `commits/`.
+The index also stores commit hashes in per-session files under `commits/` and in a global `commit_lookup.jsonl` lookup file. Commit search reads the global lookup file, so it does not need to open every session's commit index during each search.
 
 The extractor recognizes successful tool results for commands such as:
 
@@ -285,18 +285,18 @@ The extractor recognizes successful tool results for commands such as:
 
 This covers both normal `function_call_output` payloads and rtk-cleaned `event_msg.exec_command_end` payloads where the hash is preserved in `aggregated_output`.
 
+The extractor also recognizes commit-like hashes in assistant messages when the surrounding assistant text explicitly references commit/hash/git/HEAD context.
+
 For each indexed hash, the commit index stores:
 
 - observed hash
-- full hash, only when the tool output already contains 40 hexadecimal characters
+- full hash, when the tool output already contains 40 hexadecimal characters or local repository resolution succeeds
 - timestamp
 - command cwd
 - command text
 - source payload type
 
-By default, the index does not run `git` against historical working directories. That keeps daemon indexing deterministic and avoids stale or missing local repository state. When only a short hash is present, `--commit` treats it as a prefix and may return multiple sessions if the prefix is not unique.
-
-With `--resolve-commits`, refresh and daemon runs use the recorded command cwd, or the command's `git -C <path>` directory, to run:
+Refresh and daemon runs use the recorded command cwd, the session cwd for assistant-message hashes, or the command's `git -C <path>` directory, to run:
 
 ```bash
 git -C <repo> rev-parse <short-hash>^{commit}
@@ -315,7 +315,6 @@ The daemon continuously refreshes the lightweight index in the background.
 
 ```bash
 codex-session-search daemon install --interval 15s
-codex-session-search daemon install --interval 15s --resolve-commits
 ```
 
 This does three things:
@@ -370,6 +369,7 @@ Typical contents:
 ```text
 runtime/<hash>/
 ├── state.json
+├── commit_lookup.jsonl
 ├── daemon-status.json
 ├── daemon.stdout.log
 ├── daemon.stderr.log
@@ -385,6 +385,7 @@ runtime/<hash>/
 Meaning:
 
 - `state.json`: source file metadata and per-session index metadata
+- `commit_lookup.jsonl`: global commit-hash lookup used by `--commit` and TUI commit search
 - `daemon-status.json`: last daemon heartbeat and refresh status
 - `daemon.stdout.log`: daemon stdout log
 - `daemon.stderr.log`: daemon stderr log

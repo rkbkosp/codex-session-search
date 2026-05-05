@@ -52,6 +52,54 @@ func TestExtractIndexedSessionCommitRefs(t *testing.T) {
 	}
 }
 
+func TestExtractIndexedSessionAssistantCommitRefs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout-2026-05-04T10-00-00-019df31b-37dd-7b42-b161-cabd94aaaed7.jsonl")
+	lines := []string{
+		jsonLine(t, eventEnvelope{
+			Timestamp: "2026-05-04T02:00:00Z",
+			Type:      "session_meta",
+			Payload: mustRawJSON(t, sessionMeta{
+				ID:        "019df31b-37dd-7b42-b161-cabd94aaaed7",
+				Timestamp: "2026-05-04T02:00:00Z",
+				CWD:       "/repo",
+			}),
+		}),
+		jsonLine(t, eventEnvelope{
+			Timestamp: "2026-05-04T02:03:00Z",
+			Type:      "response_item",
+			Payload: mustRawJSON(t, responseItem{
+				Type: "message",
+				Role: "assistant",
+				Content: []map[string]interface{}{{
+					"type": "output_text",
+					"text": "session 019df31b-37dd-7b42-b161-cabd94aaaed7 commit: dde230d1a43b14ee9b187b314b244598050387c5",
+				}},
+			}),
+		}),
+	}
+	if err := os.WriteFile(path, []byte(joinLines(lines)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, commits, err := extractIndexedSession(sessionFile{
+		Path: path,
+		Date: "2026-05-04",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commits) != 1 {
+		t.Fatalf("len(commits) = %d, want 1", len(commits))
+	}
+	if commits[0].Hash != "dde230d1a43b14ee9b187b314b244598050387c5" || commits[0].Source != "assistant_message" {
+		t.Fatalf("commit = %#v", commits[0])
+	}
+	if commits[0].CWD != "/repo" {
+		t.Fatalf("cwd = %q, want /repo", commits[0].CWD)
+	}
+}
+
 func TestCommitMatchHasQueryHandlesPrefixes(t *testing.T) {
 	match := commitMatch{Hash: "fb5ef21"}
 	if !commitMatchHasQuery(match, "fb5") {
@@ -138,6 +186,15 @@ func TestSearchCommitsWithIndex(t *testing.T) {
 	}
 	if _, err := refreshIndex(manager); err != nil {
 		t.Fatal(err)
+	}
+	state, err := loadIndexState(manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, meta := range state.Sessions {
+		if err := os.WriteFile(filepath.Join(storage, meta.CommitIndexFile), []byte("{not json}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	results, warnings, scanned, err := searchCommitsWithIndex(manager, config{
