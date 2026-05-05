@@ -662,12 +662,14 @@ func renderTUIViewport(content string, width, height, yOffset int, style lipglos
 	height = tuiMax(1, height)
 	innerWidth := tuiMax(1, width-style.GetHorizontalFrameSize())
 	innerHeight := tuiMax(1, height-style.GetVerticalFrameSize())
+	blockWidth := tuiMax(1, width-style.GetHorizontalBorderSize()-style.GetHorizontalMargins())
+	blockHeight := tuiMax(1, height-style.GetVerticalBorderSize()-style.GetVerticalMargins())
 	vp := viewport.New(innerWidth, innerHeight)
 	vp.SetContent(content)
 	if yOffset > 0 {
 		vp.SetYOffset(yOffset)
 	}
-	return style.Width(width).Height(height).Render(vp.View())
+	return style.Width(blockWidth).Height(blockHeight).Render(vp.View())
 }
 
 func runTUISearch(root, query string, mode tuiSearchMode) ([]result, []string, int, error) {

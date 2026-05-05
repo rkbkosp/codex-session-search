@@ -1,8 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestTUIRouting(t *testing.T) {
@@ -110,10 +113,39 @@ func TestTUIViewportScrollsToBottomWithinBorderedPane(t *testing.T) {
 	}, "\n")
 
 	view := renderTUIViewport(content, 24, 4, 8, tuiPaneStyle)
+	if got := lipgloss.Height(view); got != 4 {
+		t.Fatalf("viewport height = %d, want 4: %q", got, view)
+	}
+	if got := lipgloss.Width(view); got != 24 {
+		t.Fatalf("viewport width = %d, want 24: %q", got, view)
+	}
 	if !strings.Contains(view, "line-10") {
 		t.Fatalf("viewport did not show bottom line after scroll: %q", view)
 	}
 	if strings.Contains(view, "line-07") {
 		t.Fatalf("viewport was clamped by outer height instead of inner pane height: %q", view)
+	}
+}
+
+func TestTUIResultsBodyStaysWithinAllocatedHeight(t *testing.T) {
+	model := newTUIModel("/tmp/codex", "SRT")
+	model.screen = tuiScreenResults
+	model.activeTerm = "SRT"
+	for i := 0; i < 30; i++ {
+		model.results = append(model.results, result{
+			ID:    fmt.Sprintf("019df31b-37dd-7b42-b161-cabd94aa%04d", i),
+			Title: fmt.Sprintf("SRT cleanup %02d", i),
+			Date:  "2026-05-04",
+			CWD:   "/repo/drama_workspace",
+			Snippets: []snippet{{
+				Match: message{Role: "user", Text: "fix SRT"},
+			}},
+		})
+	}
+	model.selected = len(model.results) - 1
+
+	view := model.renderResultsBody(80, 12)
+	if got := lipgloss.Height(view); got > 12 {
+		t.Fatalf("results body height = %d, want <= 12: %q", got, view)
 	}
 }
