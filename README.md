@@ -17,6 +17,7 @@ It supports:
 - Persistent lightweight index
 - Separate git commit-hash index for reverse lookup from hashes to sessions
 - Continuous background refresh on macOS via LaunchAgent or on Linux via `systemd --user`
+- GitHub Releases based version metadata and self-update checks for release builds
 
 The tool defaults to `~/.codex` as Codex home and searches `~/.codex/sessions`.
 
@@ -50,6 +51,9 @@ The binary uses Bubble Tea, Bubbles, and Lip Gloss for the TUI layer.
 ├── tui.go
 ├── index.go
 ├── daemon.go
+├── version.go
+├── release_update.go
+├── .github/workflows/release.yml
 └── runtime/                  # generated at runtime, not source
 ```
 
@@ -59,6 +63,9 @@ File roles:
 - `tui.go`: interactive TUI, launch commands, clipboard copy, search orchestration
 - `index.go`: lightweight index storage, incremental refresh, indexed search
 - `daemon.go`: index/daemon subcommands, macOS LaunchAgent and Linux systemd user-service management
+- `version.go`: build-time version metadata
+- `release_update.go`: GitHub release checking, self-update, and update notice formatting
+- `.github/workflows/release.yml`: tag/manual-dispatch release automation
 
 ## Build
 
@@ -73,6 +80,15 @@ Install to a typical user-local bin directory:
 ```bash
 mkdir -p ~/.local/bin
 go build -trimpath -ldflags="-s -w" -o ~/.local/bin/codex-session-search .
+```
+
+Release builds embed version metadata from the GitHub release workflow. For a local tagged build:
+
+```bash
+tag="$(git describe --tags --always --dirty)"
+commit="$(git rev-parse HEAD)"
+built_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+go build -trimpath -ldflags="-s -w -X main.version=$tag -X main.commit=$commit -X main.buildDate=$built_at" .
 ```
 
 Optional compatibility alias for the earlier typoed command name:
@@ -156,6 +172,7 @@ In the TUI:
 - `c` copies the current launch command
 - `r` forces CLI launch
 - `q` quits from the results screen
+- Release builds check for updates in the background; update failures or applied release notes appear at the bottom of the TUI
 
 ## Search Behavior
 
@@ -214,6 +231,7 @@ Flags:
 - `--view compact|full`: terminal output style, default `compact`
 - `--assistant-only`: shortcut for `--role assistant`
 - `--user-only`: shortcut for `--role user`
+- `--version`: print build version and exit
 - `--resolve-commits`: accepted for `index refresh` and `daemon install/run`; commit resolution is enabled by default
 
 Notes:
@@ -225,6 +243,42 @@ Notes:
 - Short hashes and full hashes are both searchable. During indexing, short hashes are resolved to full hashes through the recorded local repository when possible.
 - ANSI color/highlighting is enabled only when writing to an interactive terminal
 - `--commit` and plain query arguments still search the same data, but the bare query path now opens the TUI instead of printing results directly
+
+### Version and Update
+
+Print the embedded build metadata:
+
+```bash
+codex-session-search --version
+```
+
+Release builds use GitHub Releases as the update source. When the TUI starts, it checks the latest release in the background. If a newer platform asset exists, the app tries to replace the current binary on macOS/Linux. If replacement fails, the TUI footer prompts with the latest version and failure reason.
+
+Manual fallback:
+
+```bash
+codex-session-search upgrade
+```
+
+Set `CODEX_SESSION_SEARCH_DISABLE_AUTO_UPDATE=1` to disable startup auto-update checks.
+
+## Release Automation
+
+Releases are tag based. Push a semver tag or run the `release` workflow manually with a version:
+
+```bash
+git tag -a v0.2.0 -m "Release v0.2.0"
+git push origin v0.2.0
+```
+
+The workflow:
+
+- runs `go test ./...`
+- builds platform assets named `codex-session-search_<goos>_<goarch>` and `codex-session-search_windows_amd64.exe`
+- embeds `version`, `commit`, and `buildDate` with `-ldflags`
+- writes `checksums.txt`
+- creates or updates the GitHub Release
+- generates release notes from commit subjects between the previous tag and the new tag
 
 ## Index Commands
 

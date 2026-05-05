@@ -58,6 +58,8 @@ func handleSubcommand(args []string) (bool, int) {
 		return true, runIndexCommand(args[1:])
 	case "daemon":
 		return true, runDaemonCommand(args[1:])
+	case "upgrade":
+		return true, runUpgradeCommand(args[1:])
 	default:
 		return false, 0
 	}

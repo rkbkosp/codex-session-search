@@ -1,0 +1,133 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver release version, for example v0.2.0 or 0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            raw="${{ inputs.version }}"
+            tag="${raw#v}"
+            tag="v${tag}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag for manual release
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            existing="$(git rev-parse "${tag}^{commit}")"
+            head="$(git rev-parse HEAD)"
+            if [[ "$existing" != "$head" ]]; then
+              echo "Tag already exists on another commit: $tag" >&2
+              exit 1
+            fi
+            echo "Reusing existing tag: $tag"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tag="${{ steps.release.outputs.tag }}"
+          commit="$(git rev-parse "${tag}^{commit}")"
+          built_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          ldflags="-s -w -X main.version=$tag -X main.commit=$commit -X main.buildDate=$built_at"
+          targets=(
+            "darwin/amd64"
+            "darwin/arm64"
+            "linux/amd64"
+            "linux/arm64"
+            "windows/amd64"
+          )
+          for target in "${targets[@]}"; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            ext=""
+            if [[ "$goos" == "windows" ]]; then
+              ext=".exe"
+            fi
+            name="codex-session-search_${goos}_${goarch}${ext}"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="$ldflags" -o "dist/$name" .
+          done
+          (cd dist && sha256sum * > checksums.txt)
+
+      - name: Generate release notes from commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          commit="$(git rev-parse "${tag}^{commit}")"
+          previous="$(git describe --tags --abbrev=0 "${commit}^" 2>/dev/null || true)"
+          {
+            echo "## Changes"
+            echo
+            if [[ -n "$previous" ]]; then
+              git log --pretty=format:'- %s (%h)' "$previous..$commit"
+            else
+              git log --pretty=format:'- %s (%h)' "$commit"
+            fi
+            echo
+          } > release-notes.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+            gh release edit "$tag" --title "codex-session-search $tag" --notes-file release-notes.md
+          else
+            gh release create "$tag" dist/* --title "codex-session-search $tag" --notes-file release-notes.md
+          fi

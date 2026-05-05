@@ -151,6 +151,10 @@ type outputTheme struct {
 
 func main() {
 	args := os.Args[1:]
+	if shouldPrintVersion(args) {
+		fmt.Println(versionLine())
+		return
+	}
 	if shouldHandleSubcommand(args) {
 		_, code := handleSubcommand(args)
 		os.Exit(code)
@@ -178,10 +182,17 @@ func main() {
 }
 
 func shouldHandleSubcommand(args []string) bool {
-	if len(args) < 2 {
+	if len(args) == 0 {
 		return false
 	}
-	return args[0] == "index" || args[0] == "daemon"
+	switch args[0] {
+	case "index", "daemon":
+		return len(args) >= 2
+	case "upgrade":
+		return true
+	default:
+		return false
+	}
 }
 
 func shouldRunTUI(args []string) bool {
@@ -197,6 +208,13 @@ func shouldRunTUI(args []string) bool {
 		}
 	}
 	return true
+}
+
+func shouldPrintVersion(args []string) bool {
+	if len(args) != 1 {
+		return false
+	}
+	return args[0] == "--version" || args[0] == "-v"
 }
 
 func runIndexedSearch(cfg config) (int, bool) {
@@ -1459,6 +1477,7 @@ func printUsage(out *os.File) {
 	fmt.Fprintln(out, "  codex-session-search index status [--root PATH]")
 	fmt.Fprintln(out, "  codex-session-search daemon install [--root PATH] [--interval 15s] [--resolve-commits]")
 	fmt.Fprintln(out, "  codex-session-search daemon start|stop|status|uninstall [--root PATH]")
+	fmt.Fprintln(out, "  codex-session-search upgrade")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "TUI:")
 	fmt.Fprintln(out, "  No arguments open the main TUI. Plain query arguments open the search TUI.")
@@ -1479,6 +1498,7 @@ func printUsage(out *os.File) {
 	fmt.Fprintln(out, "  --view VALUE          compact | full (default compact)")
 	fmt.Fprintln(out, "  --assistant-only      Shortcut for --role assistant")
 	fmt.Fprintln(out, "  --user-only           Shortcut for --role user")
+	fmt.Fprintln(out, "  --version             Print build version and exit")
 	fmt.Fprintln(out, "  --resolve-commits    Accepted for index/daemon commands; commit resolution is enabled by default")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Examples:")
@@ -1492,6 +1512,8 @@ func printUsage(out *os.File) {
 	fmt.Fprintln(out, "  codex-session-search --view full --limit 5 \"drama_workspace\"")
 	fmt.Fprintln(out, "  codex-session-search --from 2026-04-01 --to 2026-04-20 \"renderwarden\"")
 	fmt.Fprintln(out, "  codex-session-search --on 2026-04-20 --limit 5 \"SRT\"")
+	fmt.Fprintln(out, "  codex-session-search --version")
+	fmt.Fprintln(out, "  codex-session-search upgrade")
 	fmt.Fprintln(out, "  codex-session-search index refresh")
 	fmt.Fprintln(out, "  codex-session-search daemon install --interval 15s")
 }

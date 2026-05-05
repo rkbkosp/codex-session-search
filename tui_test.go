@@ -21,6 +21,7 @@ func TestTUIRouting(t *testing.T) {
 		{name: "flagged query stays cli", args: []string{"--limit", "1", "drama"}},
 		{name: "index subcommand stays cli", args: []string{"index", "refresh"}, wantSubcmd: true},
 		{name: "daemon subcommand stays cli", args: []string{"daemon", "status"}, wantSubcmd: true},
+		{name: "upgrade subcommand stays cli", args: []string{"upgrade"}, wantSubcmd: true},
 		{name: "single index can be a search term", args: []string{"index"}, wantTUI: true},
 	}
 	for _, tt := range tests {
@@ -32,6 +33,18 @@ func TestTUIRouting(t *testing.T) {
 				t.Fatalf("shouldRunTUI() = %t, want %t", got, tt.wantTUI)
 			}
 		})
+	}
+}
+
+func TestVersionFlagRouting(t *testing.T) {
+	if !shouldPrintVersion([]string{"--version"}) {
+		t.Fatal("--version did not route to version output")
+	}
+	if !shouldPrintVersion([]string{"-v"}) {
+		t.Fatal("-v did not route to version output")
+	}
+	if shouldRunTUI([]string{"--version"}) {
+		t.Fatal("--version should not open the TUI")
 	}
 }
 

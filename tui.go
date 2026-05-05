@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,9 +56,10 @@ type tuiModel struct {
 	mode   tuiSearchMode
 	launch tuiLaunchMode
 
-	searchInput textinput.Model
-	activeMode  tuiSearchMode
-	activeTerm  string
+	searchInput  textinput.Model
+	activeMode   tuiSearchMode
+	activeTerm   string
+	updateNotice updateNotice
 
 	results  []result
 	warnings []string
@@ -91,6 +93,11 @@ type tuiLaunchDoneMsg struct {
 	Mode      tuiLaunchMode
 	SessionID string
 	Err       error
+}
+
+type tuiUpdateNoticeMsg struct {
+	Notice updateNotice
+	Err    error
 }
 
 var (
@@ -181,6 +188,12 @@ func newTUIModel(root, initialQuery string) tuiModel {
 	} else {
 		_ = model.searchInput.Focus()
 	}
+	if !isDevVersion(version) {
+		notice, err := startupUpdateNotice(version)
+		if err == nil {
+			model.updateNotice = notice
+		}
+	}
 	return model
 }
 
@@ -197,13 +210,17 @@ func newTUISearchInput(mode tuiSearchMode, value string) textinput.Model {
 }
 
 func (m tuiModel) Init() tea.Cmd {
+	var cmds []tea.Cmd
 	if m.loading && m.searchID > 0 {
-		return m.searchCmd(m.searchID, m.activeTerm, m.activeMode)
+		cmds = append(cmds, m.searchCmd(m.searchID, m.activeTerm, m.activeMode))
 	}
 	if m.screen == tuiScreenSearch {
-		return m.searchInput.Cursor.BlinkCmd()
+		cmds = append(cmds, m.searchInput.Cursor.BlinkCmd())
 	}
-	return nil
+	if shouldAutoCheckUpdates() {
+		cmds = append(cmds, m.updateCheckCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -247,6 +264,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "Launch failed: " + msg.Err.Error()
 		} else {
 			m.status = fmt.Sprintf("Launched %s with %s.", msg.SessionID, msg.Mode.Label())
+		}
+		return m, nil
+	case tuiUpdateNoticeMsg:
+		if msg.Err != nil {
+			m.updateNotice = updateNotice{
+				Kind:  updateNoticeFailed,
+				Error: msg.Err.Error(),
+			}
+			return m, nil
+		}
+		if msg.Notice.Kind != updateNoticeNone && msg.Notice.Kind != updateNoticeCurrent {
+			m.updateNotice = msg.Notice
 		}
 		return m, nil
 	case tea.KeyMsg:
@@ -370,6 +399,15 @@ func (m tuiModel) searchCmd(id int, query string, mode tuiSearchMode) tea.Cmd {
 	}
 }
 
+func (m tuiModel) updateCheckCmd() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
+		defer cancel()
+		notice, err := autoUpdateIfNeeded(ctx, releaseRepository)
+		return tuiUpdateNoticeMsg{Notice: notice, Err: err}
+	}
+}
+
 func (m tuiModel) copySelectedCommand() (tea.Model, tea.Cmd) {
 	res, ok := m.selectedResult()
 	if !ok {
@@ -422,7 +460,8 @@ func (m tuiModel) View() string {
 	height := tuiMax(12, m.height)
 	title := lipgloss.PlaceHorizontal(width, lipgloss.Center, tuiTitleStyle.Render("codex-session-search"))
 	search := m.renderSearchBar(width)
-	fixedHeight := lipgloss.Height(title) + lipgloss.Height(search)
+	footer := m.renderUpdateFooter(width)
+	fixedHeight := lipgloss.Height(title) + lipgloss.Height(search) + lipgloss.Height(footer)
 	bodyHeight := tuiMax(6, height-fixedHeight)
 	var body string
 	if m.screen == tuiScreenResults {
@@ -430,7 +469,11 @@ func (m tuiModel) View() string {
 	} else {
 		body = m.renderSearchBody(width, bodyHeight)
 	}
-	return lipgloss.NewStyle().Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, title, search, body))
+	parts := []string{title, search, body}
+	if footer != "" {
+		parts = append(parts, footer)
+	}
+	return lipgloss.NewStyle().Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, parts...))
 }
 
 func (m tuiModel) renderSearchBar(width int) string {
@@ -526,6 +569,21 @@ func (m tuiModel) renderResultsStatus(width int) string {
 		text += "  " + tuiDimStyle.Render(strings.Join(meta, " | "))
 	}
 	return lipgloss.NewStyle().Width(width).Render(text)
+}
+
+func (m tuiModel) renderUpdateFooter(width int) string {
+	if m.updateNotice.Kind == updateNoticeNone {
+		return ""
+	}
+	lines := updateNoticeLines(m.updateNotice, tuiMax(20, width-4), 4)
+	if len(lines) == 0 {
+		return ""
+	}
+	parts := []string{tuiDimStyle.Render("update")}
+	for _, line := range lines {
+		parts = append(parts, tuiDimStyle.Render(line))
+	}
+	return tuiPaneStyle.Width(width).Render(strings.Join(parts, "\n"))
 }
 
 func (m tuiModel) renderResultList() string {

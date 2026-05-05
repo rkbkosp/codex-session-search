@@ -43,14 +43,30 @@ release_tag="$(gh release view --repo "$repo" --json tagName --jq .tagName)"
 gh release download --repo "$repo" "$release_tag" --dir "$tmpdir"
 ```
 
+Release assets are named by platform, for example:
+
+```text
+codex-session-search_darwin_arm64
+codex-session-search_linux_amd64
+codex-session-search_windows_amd64.exe
+```
+
 If the release assets include a platform match for the user, install that binary to the user-local bin directory:
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-install -m 0755 "$tmpdir/codex-session-search" "$HOME/.local/bin/codex-session-search"
+asset="codex-session-search_darwin_arm64" # replace with the user's OS/architecture asset
+install -m 0755 "$tmpdir/$asset" "$HOME/.local/bin/codex-session-search"
 ```
 
 If the release ships archives, unpack the matching one and install the binary from inside the archive.
+
+After installing a release build, verify the embedded version and optional updater:
+
+```bash
+codex-session-search --version
+codex-session-search upgrade
+```
 
 ## Fallback Install: Build From Source
 
