@@ -1,4 +1,13 @@
-# codex-session-search
+<h1 align="center">codex-session-search</h1>
+
+<p align="center">
+  <strong>Search, browse, and open local Codex session history in milliseconds.</strong>
+</p>
+
+<p align="center">
+  <img src="assets/demo.gif" alt="codex-session-search TUI demo" width="900">
+</p>
+
 
 Local CLI for searching Codex session history stored under `~/.codex/sessions`.
 
