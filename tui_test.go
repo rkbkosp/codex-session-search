@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -44,6 +45,67 @@ func TestNormalizeTUICommitQuery(t *testing.T) {
 	}
 	if _, err := normalizeTUIQuery("not-a-hash", tuiSearchCommit); err == nil {
 		t.Fatal("expected invalid commit query error")
+	}
+}
+
+func TestTUISearchTabSwitchesSearchMode(t *testing.T) {
+	model := newTUIModel("/tmp/codex", "")
+	model.searchInput.SetValue("drama")
+	model.searchInput.CursorEnd()
+
+	model = updateTUIModelForTest(t, model, tea.KeyMsg{Type: tea.KeyTab})
+	if model.mode != tuiSearchCommit {
+		t.Fatalf("mode = %v, want commit search", model.mode)
+	}
+	if got := model.searchInput.Value(); got != "drama" {
+		t.Fatalf("query = %q, want drama", got)
+	}
+}
+
+func TestTUISearchLeftRightMoveCursor(t *testing.T) {
+	model := newTUIModel("/tmp/codex", "")
+	model.searchInput.SetValue("abc")
+	model.searchInput.CursorEnd()
+
+	model = updateTUIModelForTest(t, model, tea.KeyMsg{Type: tea.KeyLeft})
+	if model.mode != tuiSearchText {
+		t.Fatalf("left changed search mode to %v", model.mode)
+	}
+	if got := model.searchInput.Position(); got != 2 {
+		t.Fatalf("cursor after left = %d, want 2", got)
+	}
+
+	model = updateTUIModelForTest(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("X")})
+	if got := model.searchInput.Value(); got != "abXc" {
+		t.Fatalf("query after insert = %q, want abXc", got)
+	}
+
+	model = updateTUIModelForTest(t, model, tea.KeyMsg{Type: tea.KeyRight})
+	if got := model.searchInput.Position(); got != 4 {
+		t.Fatalf("cursor after right = %d, want 4", got)
+	}
+}
+
+func TestTUISearchEnterStartsSearch(t *testing.T) {
+	model := newTUIModel("/tmp/codex", "")
+	model.searchInput.SetValue(" drama ")
+	model.searchInput.CursorEnd()
+
+	model = updateTUIModelForTest(t, model, tea.KeyMsg{Type: tea.KeyEnter})
+	if model.screen != tuiScreenResults {
+		t.Fatalf("screen = %v, want results", model.screen)
+	}
+	if !model.loading {
+		t.Fatal("model is not loading after enter")
+	}
+	if model.activeTerm != "drama" {
+		t.Fatalf("activeTerm = %q, want drama", model.activeTerm)
+	}
+	if got := model.searchInput.Value(); got != "drama" {
+		t.Fatalf("query = %q, want normalized drama", got)
+	}
+	if model.searchID != 1 {
+		t.Fatalf("searchID = %d, want 1", model.searchID)
 	}
 }
 
@@ -148,4 +210,14 @@ func TestTUIResultsBodyStaysWithinAllocatedHeight(t *testing.T) {
 	if got := lipgloss.Height(view); got > 12 {
 		t.Fatalf("results body height = %d, want <= 12: %q", got, view)
 	}
+}
+
+func updateTUIModelForTest(t *testing.T, model tuiModel, msg tea.Msg) tuiModel {
+	t.Helper()
+	updated, _ := model.Update(msg)
+	next, ok := updated.(tuiModel)
+	if !ok {
+		t.Fatalf("updated model type = %T, want tuiModel", updated)
+	}
+	return next
 }

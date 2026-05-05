@@ -11,8 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -55,9 +55,9 @@ type tuiModel struct {
 	mode   tuiSearchMode
 	launch tuiLaunchMode
 
-	query      string
-	activeMode tuiSearchMode
-	activeTerm string
+	searchInput textinput.Model
+	activeMode  tuiSearchMode
+	activeTerm  string
 
 	results  []result
 	warnings []string
@@ -160,15 +160,16 @@ func interactiveTerminal() bool {
 }
 
 func newTUIModel(root, initialQuery string) tuiModel {
+	input := newTUISearchInput(tuiSearchText, initialQuery)
 	model := tuiModel{
-		root:       root,
-		width:      80,
-		height:     24,
-		screen:     tuiScreenSearch,
-		mode:       tuiSearchText,
-		activeMode: tuiSearchText,
-		query:      initialQuery,
-		launch:     tuiLaunchCLI,
+		root:        root,
+		width:       80,
+		height:      24,
+		screen:      tuiScreenSearch,
+		mode:        tuiSearchText,
+		activeMode:  tuiSearchText,
+		searchInput: input,
+		launch:      tuiLaunchCLI,
 	}
 	if initialQuery != "" {
 		model.screen = tuiScreenResults
@@ -176,13 +177,31 @@ func newTUIModel(root, initialQuery string) tuiModel {
 		model.searchID = 1
 		model.activeTerm = initialQuery
 		model.status = "Searching..."
+		model.searchInput.Blur()
+	} else {
+		_ = model.searchInput.Focus()
 	}
 	return model
+}
+
+func newTUISearchInput(mode tuiSearchMode, value string) textinput.Model {
+	input := textinput.New()
+	input.Prompt = ""
+	input.Placeholder = mode.Placeholder()
+	input.PlaceholderStyle = tuiDimStyle
+	input.TextStyle = tuiStatusStyle
+	input.Cursor.Style = lipgloss.NewStyle().Reverse(true)
+	input.SetValue(value)
+	input.CursorEnd()
+	return input
 }
 
 func (m tuiModel) Init() tea.Cmd {
 	if m.loading && m.searchID > 0 {
 		return m.searchCmd(m.searchID, m.activeTerm, m.activeMode)
+	}
+	if m.screen == tuiScreenSearch {
+		return m.searchInput.Cursor.BlinkCmd()
 	}
 	return nil
 }
@@ -246,6 +265,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.updateSearchKey(msg)
 	}
+	if m.screen == tuiScreenSearch && !m.loading {
+		var cmd tea.Cmd
+		m.searchInput, cmd = m.searchInput.Update(msg)
+		return m, cmd
+	}
 	return m, nil
 }
 
@@ -253,32 +277,21 @@ func (m tuiModel) updateSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
 		return m.startSearch()
-	case "left", "right":
+	case "tab", "shift+tab":
 		m.mode = m.mode.Toggle()
+		m.searchInput.Placeholder = m.mode.Placeholder()
 		m.status = "Search mode: " + m.mode.Label()
-		return m, nil
-	case "backspace", "ctrl+h":
-		m.query = removeLastRune(m.query)
-		m.status = ""
-		return m, nil
-	case "ctrl+u":
-		m.query = ""
-		m.status = ""
 		return m, nil
 	case "esc":
 		return m, tea.Quit
 	}
-	if msg.Type == tea.KeyRunes {
-		m.query += string(msg.Runes)
+	before := m.searchInput.Value()
+	var cmd tea.Cmd
+	m.searchInput, cmd = m.searchInput.Update(msg)
+	if m.searchInput.Value() != before {
 		m.status = ""
-		return m, nil
 	}
-	if msg.Type == tea.KeySpace {
-		m.query += " "
-		m.status = ""
-		return m, nil
-	}
-	return m, nil
+	return m, cmd
 }
 
 func (m tuiModel) updateResultsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -289,7 +302,7 @@ func (m tuiModel) updateResultsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.screen = tuiScreenSearch
 		m.errText = ""
 		m.status = "Edit search and press Enter."
-		return m, nil
+		return m, m.searchInput.Focus()
 	case "up", "k":
 		m.selected = tuiMax(0, m.selected-1)
 		m.status = ""
@@ -315,13 +328,15 @@ func (m tuiModel) updateResultsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) startSearch() (tea.Model, tea.Cmd) {
-	query, err := normalizeTUIQuery(m.query, m.mode)
+	query, err := normalizeTUIQuery(m.searchInput.Value(), m.mode)
 	if err != nil {
 		m.errText = ""
 		m.status = err.Error()
 		return m, nil
 	}
-	m.query = query
+	m.searchInput.SetValue(query)
+	m.searchInput.CursorEnd()
+	m.searchInput.Blur()
 	m.activeTerm = query
 	m.activeMode = m.mode
 	m.screen = tuiScreenResults
@@ -425,15 +440,16 @@ func (m tuiModel) renderSearchBar(width int) string {
 		m.modePill(tuiSearchCommit),
 	)
 	boxWidth := tuiMax(20, width-lipgloss.Width(modeLine)-6)
-	valueWidth := tuiMax(1, boxWidth-tuiInputStyle.GetHorizontalFrameSize()-2)
-	value := tailString(m.query, valueWidth)
-	if value == "" {
-		value = tuiDimStyle.Render(m.mode.Placeholder())
-	}
+	valueWidth := tuiMax(1, boxWidth-tuiInputStyle.GetHorizontalFrameSize())
+	input := m.searchInput
+	input.Placeholder = m.mode.Placeholder()
+	input.Width = valueWidth
 	if m.screen == tuiScreenSearch && !m.loading {
-		value += lipgloss.NewStyle().Reverse(true).Render(" ")
+		_ = input.Focus()
+	} else {
+		input.Blur()
 	}
-	box := tuiInputStyle.Width(boxWidth).Render(value)
+	box := tuiInputStyle.Width(boxWidth).Render(input.View())
 	return lipgloss.PlaceHorizontal(width, lipgloss.Center, lipgloss.JoinHorizontal(lipgloss.Center, modeLine, "  ", box))
 }
 
@@ -451,7 +467,7 @@ func (m tuiModel) renderSearchBody(width, height int) string {
 	if m.status != "" {
 		lines = append(lines, tuiStatusStyle.Render(m.status))
 	}
-	lines = append(lines, tuiDimStyle.Render("Enter search | Left/Right mode | Esc quit"))
+	lines = append(lines, tuiDimStyle.Render("Enter search | Tab mode | Left/Right cursor | Esc quit"))
 	content := strings.Join(lines, "\n")
 	return lipgloss.NewStyle().Width(width).Height(height).Align(lipgloss.Center).Render(content)
 }
@@ -502,7 +518,7 @@ func (m tuiModel) renderResultsStatus(width int) string {
 	}
 	meta = append(meta, "launch:"+m.launch.Label())
 	meta = append(meta, "Enter open")
-	meta = append(meta, "Tab mode")
+	meta = append(meta, "Tab launch")
 	meta = append(meta, "c copy")
 	meta = append(meta, "r cli")
 	meta = append(meta, "q quit")
@@ -906,28 +922,6 @@ func commandError(cmd *exec.Cmd, output []byte, err error) error {
 		return fmt.Errorf("%s: %w", displayCommand(cmd.Path, cmd.Args[1:]), err)
 	}
 	return fmt.Errorf("%s: %w: %s", displayCommand(cmd.Path, cmd.Args[1:]), err, normalizeWhitespace(text))
-}
-
-func removeLastRune(value string) string {
-	if value == "" {
-		return ""
-	}
-	_, size := utf8.DecodeLastRuneInString(value)
-	if size <= 0 {
-		return ""
-	}
-	return value[:len(value)-size]
-}
-
-func tailString(value string, maxRunes int) string {
-	if maxRunes <= 0 || utf8.RuneCountInString(value) <= maxRunes {
-		return value
-	}
-	if maxRunes <= 3 {
-		return string([]rune(value)[:maxRunes])
-	}
-	runes := []rune(value)
-	return "..." + string(runes[len(runes)-(maxRunes-3):])
 }
 
 func tuiMin(a, b int) int {

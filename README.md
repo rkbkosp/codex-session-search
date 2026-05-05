@@ -148,8 +148,9 @@ codex-session-search --json --last 3h "codex session"
 
 In the TUI:
 
-- Left and right switch between normal search and git commit hash search
+- Tab switches between normal search and git commit hash search
 - Enter runs the search
+- Left and right move the text cursor in the search box
 - Up and down move the selected session
 - Tab switches the launch mode between CLI and deep link (`open codex://threads/<session id>` on macOS)
 - `c` copies the current launch command
