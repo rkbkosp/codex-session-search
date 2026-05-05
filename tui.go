@@ -658,13 +658,16 @@ func renderMessagePreviewLine(msg message, cfg config, matched bool) string {
 }
 
 func renderTUIViewport(content string, width, height, yOffset int, style lipgloss.Style) string {
-	vp := viewport.New(tuiMax(1, width), tuiMax(1, height))
-	vp.Style = style.Width(tuiMax(1, width)).Height(tuiMax(1, height))
+	width = tuiMax(1, width)
+	height = tuiMax(1, height)
+	innerWidth := tuiMax(1, width-style.GetHorizontalFrameSize())
+	innerHeight := tuiMax(1, height-style.GetVerticalFrameSize())
+	vp := viewport.New(innerWidth, innerHeight)
 	vp.SetContent(content)
 	if yOffset > 0 {
 		vp.SetYOffset(yOffset)
 	}
-	return vp.View()
+	return style.Width(width).Height(height).Render(vp.View())
 }
 
 func runTUISearch(root, query string, mode tuiSearchMode) ([]result, []string, int, error) {

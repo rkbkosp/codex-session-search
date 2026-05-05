@@ -94,3 +94,26 @@ func TestTUIPreviewOmitsSessionFilePath(t *testing.T) {
 		t.Fatalf("preview contains session file path: %q", view)
 	}
 }
+
+func TestTUIViewportScrollsToBottomWithinBorderedPane(t *testing.T) {
+	content := strings.Join([]string{
+		"line-01",
+		"line-02",
+		"line-03",
+		"line-04",
+		"line-05",
+		"line-06",
+		"line-07",
+		"line-08",
+		"line-09",
+		"line-10",
+	}, "\n")
+
+	view := renderTUIViewport(content, 24, 4, 8, tuiPaneStyle)
+	if !strings.Contains(view, "line-10") {
+		t.Fatalf("viewport did not show bottom line after scroll: %q", view)
+	}
+	if strings.Contains(view, "line-07") {
+		t.Fatalf("viewport was clamped by outer height instead of inner pane height: %q", view)
+	}
+}
