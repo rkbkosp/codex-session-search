@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -19,7 +22,10 @@ import (
 const (
 	updateCheckTimeout    = 8 * time.Second
 	updateDownloadTimeout = 90 * time.Second
+	updateVersionTimeout  = 5 * time.Second
+	updateFailureCooldown = 6 * time.Hour
 	updateStateFileName   = "update-state.json"
+	updateChecksumName    = "checksums.txt"
 )
 
 var semverPattern = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$`)
@@ -35,12 +41,14 @@ const (
 )
 
 type updateNotice struct {
-	Kind           updateNoticeKind
-	CurrentVersion string
-	LatestVersion  string
-	ReleaseURL     string
-	ReleaseNotes   string
-	Error          string
+	Kind               updateNoticeKind
+	CurrentVersion     string
+	LatestVersion      string
+	ReleaseURL         string
+	ReleaseNotes       string
+	Error              string
+	DaemonRestarted    bool
+	DaemonRestartError string
 }
 
 type githubRelease struct {
@@ -62,12 +70,23 @@ type githubReleaseAsset struct {
 }
 
 type updateState struct {
-	TagName    string `json:"tag_name"`
-	Version    string `json:"version"`
-	Notes      string `json:"notes,omitempty"`
-	ReleaseURL string `json:"release_url,omitempty"`
-	UpdatedAt  string `json:"updated_at,omitempty"`
-	Shown      bool   `json:"shown,omitempty"`
+	TagName            string `json:"tag_name"`
+	Version            string `json:"version"`
+	Notes              string `json:"notes,omitempty"`
+	ReleaseURL         string `json:"release_url,omitempty"`
+	UpdatedAt          string `json:"updated_at,omitempty"`
+	Shown              bool   `json:"shown,omitempty"`
+	DaemonRestarted    bool   `json:"daemon_restarted,omitempty"`
+	DaemonRestartError string `json:"daemon_restart_error,omitempty"`
+	FailedTagName      string `json:"failed_tag_name,omitempty"`
+	Failure            string `json:"failure,omitempty"`
+	FailedAt           string `json:"failed_at,omitempty"`
+}
+
+type updateApplyResult struct {
+	Applied            bool
+	DaemonRestarted    bool
+	DaemonRestartError string
 }
 
 func updateStatePath() (string, error) {
@@ -125,11 +144,13 @@ func startupUpdateNotice(currentVersion string) (updateNotice, error) {
 	state.Shown = true
 	_ = saveUpdateState(state)
 	return updateNotice{
-		Kind:           updateNoticeUpdated,
-		CurrentVersion: currentVersion,
-		LatestVersion:  state.TagName,
-		ReleaseURL:     state.ReleaseURL,
-		ReleaseNotes:   state.Notes,
+		Kind:               updateNoticeUpdated,
+		CurrentVersion:     currentVersion,
+		LatestVersion:      state.TagName,
+		ReleaseURL:         state.ReleaseURL,
+		ReleaseNotes:       state.Notes,
+		DaemonRestarted:    state.DaemonRestarted,
+		DaemonRestartError: state.DaemonRestartError,
 	}, nil
 }
 
@@ -169,14 +190,23 @@ func autoUpdateIfNeeded(ctx context.Context, repo string) (updateNotice, error) 
 	if notice.Kind != updateNoticeAvailable {
 		return notice, nil
 	}
+	if skipped, failure := shouldSkipRecentFailedUpdate(notice.LatestVersion); skipped {
+		notice.Kind = updateNoticeFailed
+		notice.Error = failure
+		return notice, nil
+	}
 	applied, err := applyReleaseUpdate(ctx, repo, notice.LatestVersion)
 	if err != nil {
 		notice.Kind = updateNoticeFailed
 		notice.Error = err.Error()
+		_ = saveFailedUpdateState(notice)
 		return notice, nil
 	}
-	if applied {
+	if applied.Applied {
 		notice.Kind = updateNoticeUpdated
+		notice.DaemonRestarted = applied.DaemonRestarted
+		notice.DaemonRestartError = applied.DaemonRestartError
+		_ = saveAppliedUpdateState(notice)
 		return notice, nil
 	}
 	notice.Kind = updateNoticeFailed
@@ -184,21 +214,33 @@ func autoUpdateIfNeeded(ctx context.Context, repo string) (updateNotice, error) 
 	return notice, nil
 }
 
-func applyReleaseUpdate(ctx context.Context, repo, tag string) (bool, error) {
+func applyReleaseUpdate(ctx context.Context, repo, tag string) (updateApplyResult, error) {
 	if !isSelfUpdateSupported() {
-		return false, errors.New("self-update is only supported on macOS and Linux")
+		return updateApplyResult{}, errors.New("self-update is only supported on macOS and Linux")
 	}
 	release, err := fetchGitHubRelease(ctx, repo, tag)
 	if err != nil {
-		return false, err
+		return updateApplyResult{}, err
 	}
 	asset, ok := selectReleaseAsset(release, runtime.GOOS, runtime.GOARCH)
 	if !ok {
-		return false, fmt.Errorf("no release asset found for %s/%s", runtime.GOOS, runtime.GOARCH)
+		return updateApplyResult{}, fmt.Errorf("no release asset found for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	checksumAsset, ok := selectChecksumAsset(release)
+	if !ok {
+		return updateApplyResult{}, fmt.Errorf("release asset %s was not found", updateChecksumName)
+	}
+	checksums, err := downloadReleaseChecksums(ctx, checksumAsset)
+	if err != nil {
+		return updateApplyResult{}, err
+	}
+	expectedChecksum, err := checksumForAsset(checksums, asset.Name)
+	if err != nil {
+		return updateApplyResult{}, err
 	}
 	exe, err := os.Executable()
 	if err != nil {
-		return false, err
+		return updateApplyResult{}, err
 	}
 	exe, err = filepath.EvalSymlinks(exe)
 	if err != nil {
@@ -206,7 +248,7 @@ func applyReleaseUpdate(ctx context.Context, repo, tag string) (bool, error) {
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(exe), "codex-session-search-update-*")
 	if err != nil {
-		return false, err
+		return updateApplyResult{}, err
 	}
 	tmpPath := tmp.Name()
 	defer func() {
@@ -217,22 +259,34 @@ func applyReleaseUpdate(ctx context.Context, repo, tag string) (bool, error) {
 	downloadCtx, cancel := context.WithTimeout(ctx, updateDownloadTimeout)
 	defer cancel()
 	if err := downloadReleaseAsset(downloadCtx, asset.BrowserDownloadURL, tmp); err != nil {
-		return false, err
+		return updateApplyResult{}, err
 	}
 	if err := tmp.Chmod(0o755); err != nil {
-		return false, err
+		return updateApplyResult{}, err
 	}
 	if err := tmp.Close(); err != nil {
-		return false, err
+		return updateApplyResult{}, err
+	}
+	if err := verifyDownloadedChecksum(tmpPath, asset.Name, expectedChecksum); err != nil {
+		return updateApplyResult{}, err
+	}
+	if err := verifyReleaseBinary(ctx, tmpPath, tag); err != nil {
+		return updateApplyResult{}, err
 	}
 
 	if runtime.GOOS == "windows" {
-		return false, errors.New("windows self-update is not supported by this build")
+		return updateApplyResult{}, errors.New("windows self-update is not supported by this build")
 	}
 	if err := os.Rename(tmpPath, exe); err != nil {
-		return false, err
+		return updateApplyResult{}, err
 	}
-	return true, nil
+	result := updateApplyResult{Applied: true}
+	restarted, restartErr := restartRunningDaemon()
+	result.DaemonRestarted = restarted
+	if restartErr != nil {
+		result.DaemonRestartError = restartErr.Error()
+	}
+	return result, nil
 }
 
 func fetchLatestGitHubRelease(ctx context.Context, repo string) (githubRelease, error) {
@@ -304,6 +358,15 @@ func selectReleaseAsset(release githubRelease, goos, goarch string) (githubRelea
 	return githubReleaseAsset{}, false
 }
 
+func selectChecksumAsset(release githubRelease) (githubReleaseAsset, bool) {
+	for _, asset := range release.Assets {
+		if asset.Name == updateChecksumName {
+			return asset, true
+		}
+	}
+	return githubReleaseAsset{}, false
+}
+
 func releaseAssetName(goos, goarch string) string {
 	name := fmt.Sprintf("codex-session-search_%s_%s", goos, goarch)
 	if goos == "windows" {
@@ -326,6 +389,24 @@ func shouldAutoCheckUpdates() bool {
 	return true
 }
 
+func shouldSkipRecentFailedUpdate(tag string) (bool, string) {
+	state, err := loadUpdateState()
+	if err != nil {
+		return false, ""
+	}
+	if normalizedVersion(state.FailedTagName) != normalizedVersion(tag) || state.Failure == "" || state.FailedAt == "" {
+		return false, ""
+	}
+	failedAt, err := time.Parse(time.RFC3339, state.FailedAt)
+	if err != nil {
+		return false, ""
+	}
+	if time.Since(failedAt) > updateFailureCooldown {
+		return false, ""
+	}
+	return true, state.Failure
+}
+
 func mustAbs(path string) string {
 	if filepath.IsAbs(path) {
 		return path
@@ -334,6 +415,140 @@ func mustAbs(path string) string {
 		return abs
 	}
 	return path
+}
+
+func downloadReleaseChecksums(ctx context.Context, asset githubReleaseAsset) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := downloadReleaseAsset(ctx, asset.BrowserDownloadURL, &buf); err != nil {
+		return nil, fmt.Errorf("download %s: %w", updateChecksumName, err)
+	}
+	return buf.Bytes(), nil
+}
+
+func checksumForAsset(checksums []byte, assetName string) (string, error) {
+	for _, rawLine := range strings.Split(string(checksums), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		sum := strings.ToLower(fields[0])
+		name := strings.TrimPrefix(fields[1], "*")
+		if name != assetName {
+			continue
+		}
+		if len(sum) != sha256.Size*2 {
+			return "", fmt.Errorf("invalid checksum length for %s", assetName)
+		}
+		if _, err := hex.DecodeString(sum); err != nil {
+			return "", fmt.Errorf("invalid checksum for %s: %w", assetName, err)
+		}
+		return sum, nil
+	}
+	return "", fmt.Errorf("checksum for %s was not found in %s", assetName, updateChecksumName)
+}
+
+func verifyDownloadedChecksum(path, assetName, expected string) error {
+	actual, err := fileSHA256(path)
+	if err != nil {
+		return err
+	}
+	if actual != strings.ToLower(expected) {
+		return fmt.Errorf("checksum mismatch for %s: expected %s, got %s", assetName, expected, actual)
+	}
+	return nil
+}
+
+func fileSHA256(path string) (string, error) {
+	handle, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer handle.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, handle); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func verifyReleaseBinary(ctx context.Context, path, tag string) error {
+	probeCtx, cancel := context.WithTimeout(ctx, updateVersionTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, path, "--version")
+	output, err := cmd.CombinedOutput()
+	if probeCtx.Err() != nil {
+		return fmt.Errorf("version check timed out for downloaded binary")
+	}
+	text := strings.TrimSpace(string(output))
+	if err != nil {
+		if text == "" {
+			return fmt.Errorf("version check failed for downloaded binary: %w", err)
+		}
+		return fmt.Errorf("version check failed for downloaded binary: %w: %s", err, normalizeWhitespace(text))
+	}
+	if err := validateVersionOutput(text, tag); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateVersionOutput(output, tag string) error {
+	fields := strings.Fields(strings.TrimSpace(output))
+	if len(fields) < 2 || fields[0] != "codex-session-search" {
+		return fmt.Errorf("downloaded binary returned unexpected version output: %s", nonEmpty(output, "(empty)"))
+	}
+	got := normalizedVersion(fields[1])
+	want := normalizedVersion(tag)
+	if got == "" || got != want {
+		return fmt.Errorf("downloaded binary version %s did not match %s", fields[1], tag)
+	}
+	return nil
+}
+
+func restartRunningDaemon() (bool, error) {
+	root, err := expandPath(defaultRoot)
+	if err != nil {
+		return false, err
+	}
+	manager, err := newIndexManager(root)
+	if err != nil {
+		return false, err
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		if !fileExists(manager.LaunchAgentPath) {
+			return false, nil
+		}
+		loaded, _ := isLaunchdDaemonLoaded(manager)
+		if !loaded {
+			return false, nil
+		}
+		if err := kickstartLaunchdDaemon(manager); err != nil {
+			return false, err
+		}
+		return true, nil
+	case "linux":
+		if !fileExists(manager.SystemdUnitPath) {
+			return false, nil
+		}
+		status, err := readSystemdUnitStatus(manager)
+		if err != nil {
+			return false, err
+		}
+		if status.ActiveState != "active" {
+			return false, nil
+		}
+		if err := runSystemctlUser("restart", systemdUnitName(manager)); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 func compareVersions(current, latest string) int {
@@ -448,6 +663,11 @@ func updateNoticeLines(notice updateNotice, width int, maxLines int) []string {
 	if notice.Error != "" {
 		appendLine("Auto update: " + notice.Error)
 	}
+	if notice.DaemonRestartError != "" {
+		appendLine("Daemon restart: " + notice.DaemonRestartError)
+	} else if notice.DaemonRestarted {
+		appendLine("Daemon restarted.")
+	}
 	for _, line := range splitUpdateNotes(notice.ReleaseNotes) {
 		if len(lines) >= maxLines {
 			break
@@ -538,25 +758,42 @@ func upgradeFromGitHub(ctx context.Context, repo string) (updateNotice, error) {
 	if err != nil {
 		notice.Kind = updateNoticeFailed
 		notice.Error = err.Error()
+		_ = saveFailedUpdateState(notice)
 		return notice, nil
 	}
-	if !applied {
+	if !applied.Applied {
 		notice.Kind = updateNoticeFailed
 		notice.Error = "update was not applied"
 		return notice, nil
 	}
 	notice.Kind = updateNoticeUpdated
-	if err := saveUpdateState(updateState{
-		TagName:    notice.LatestVersion,
-		Version:    normalizedVersion(notice.LatestVersion),
-		Notes:      notice.ReleaseNotes,
-		ReleaseURL: notice.ReleaseURL,
-		UpdatedAt:  time.Now().Format(time.RFC3339),
-		Shown:      false,
-	}); err != nil {
+	notice.DaemonRestarted = applied.DaemonRestarted
+	notice.DaemonRestartError = applied.DaemonRestartError
+	if err := saveAppliedUpdateState(notice); err != nil {
 		return notice, err
 	}
 	return notice, nil
+}
+
+func saveAppliedUpdateState(notice updateNotice) error {
+	return saveUpdateState(updateState{
+		TagName:            notice.LatestVersion,
+		Version:            normalizedVersion(notice.LatestVersion),
+		Notes:              notice.ReleaseNotes,
+		ReleaseURL:         notice.ReleaseURL,
+		UpdatedAt:          time.Now().Format(time.RFC3339),
+		Shown:              false,
+		DaemonRestarted:    notice.DaemonRestarted,
+		DaemonRestartError: notice.DaemonRestartError,
+	})
+}
+
+func saveFailedUpdateState(notice updateNotice) error {
+	state, _ := loadUpdateState()
+	state.FailedTagName = notice.LatestVersion
+	state.Failure = notice.Error
+	state.FailedAt = time.Now().Format(time.RFC3339)
+	return saveUpdateState(state)
 }
 
 func printUpdateNotice(out io.Writer, notice updateNotice) {

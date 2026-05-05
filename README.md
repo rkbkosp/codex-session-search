@@ -258,7 +258,9 @@ Print the embedded build metadata:
 codex-session-search --version
 ```
 
-Release builds use GitHub Releases as the update source. When the TUI starts, it checks the latest release in the background. If a newer platform asset exists, the app tries to replace the current binary on macOS/Linux. If replacement fails, the TUI footer prompts with the latest version and failure reason.
+Release builds use GitHub Releases as the update source. When the TUI starts, it checks the latest release in the background. If a newer platform asset exists, the app downloads it to a temporary file, verifies `checksums.txt`, verifies that the temporary binary's `--version` output matches the release tag, and only then replaces the current binary on macOS/Linux.
+
+After a verified replacement, the updater best-effort restarts the default background daemon only if it is already installed and currently running. Validation or restart failures do not stop the active TUI session or the currently running daemon; the TUI footer prompts with the latest version and failure reason. Automatic checks remember a failed release briefly so the TUI does not repeatedly download the same bad asset; `codex-session-search upgrade` can still be used to retry manually.
 
 Manual fallback:
 

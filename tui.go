@@ -401,7 +401,7 @@ func (m tuiModel) searchCmd(id int, query string, mode tuiSearchMode) tea.Cmd {
 
 func (m tuiModel) updateCheckCmd() tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout+updateDownloadTimeout+updateVersionTimeout)
 		defer cancel()
 		notice, err := autoUpdateIfNeeded(ctx, releaseRepository)
 		return tuiUpdateNoticeMsg{Notice: notice, Err: err}

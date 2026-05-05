@@ -1,8 +1,13 @@
 package main
 
 import (
+	"crypto/sha256"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCompareVersions(t *testing.T) {
@@ -55,6 +60,96 @@ func TestSelectReleaseAsset(t *testing.T) {
 	}
 }
 
+func TestSelectChecksumAsset(t *testing.T) {
+	release := githubRelease{Assets: []githubReleaseAsset{
+		{Name: "codex-session-search_linux_amd64", BrowserDownloadURL: "https://example.invalid/linux"},
+		{Name: updateChecksumName, BrowserDownloadURL: "https://example.invalid/checksums"},
+	}}
+	asset, ok := selectChecksumAsset(release)
+	if !ok {
+		t.Fatal("checksum asset was not selected")
+	}
+	if asset.BrowserDownloadURL != "https://example.invalid/checksums" {
+		t.Fatalf("checksum asset URL = %q", asset.BrowserDownloadURL)
+	}
+}
+
+func TestChecksumForAsset(t *testing.T) {
+	checksums := []byte(strings.Join([]string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  codex-session-search_linux_amd64",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  *codex-session-search_darwin_arm64",
+	}, "\n"))
+	got, err := checksumForAsset(checksums, "codex-session-search_darwin_arm64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Repeat("b", sha256.Size*2)
+	if got != want {
+		t.Fatalf("checksum = %q, want %q", got, want)
+	}
+}
+
+func TestVerifyDownloadedChecksum(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "asset")
+	data := []byte("release asset")
+	if err := os.WriteFile(path, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := fmt.Sprintf("%x", sha256.Sum256(data))
+	if err := verifyDownloadedChecksum(path, "asset", sum); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyDownloadedChecksum(path, "asset", strings.Repeat("0", sha256.Size*2)); err == nil {
+		t.Fatal("expected checksum mismatch")
+	}
+}
+
+func TestValidateVersionOutput(t *testing.T) {
+	if err := validateVersionOutput("codex-session-search v0.3.0 (abc, built now)", "v0.3.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateVersionOutput("codex-session-search 0.3.0 (abc, built now)", "v0.3.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateVersionOutput("codex-session-search v0.2.9 (abc, built now)", "v0.3.0"); err == nil {
+		t.Fatal("expected version mismatch")
+	}
+	if err := validateVersionOutput("unexpected output", "v0.3.0"); err == nil {
+		t.Fatal("expected unexpected output error")
+	}
+}
+
+func TestShouldSkipRecentFailedUpdate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := saveUpdateState(updateState{
+		FailedTagName: "v0.3.0",
+		Failure:       "checksum mismatch",
+		FailedAt:      time.Now().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	skipped, failure := shouldSkipRecentFailedUpdate("0.3.0")
+	if !skipped {
+		t.Fatal("expected recent failed update to be skipped")
+	}
+	if failure != "checksum mismatch" {
+		t.Fatalf("failure = %q", failure)
+	}
+
+	if err := saveUpdateState(updateState{
+		FailedTagName: "v0.3.0",
+		Failure:       "checksum mismatch",
+		FailedAt:      time.Now().Add(-updateFailureCooldown - time.Minute).Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	skipped, _ = shouldSkipRecentFailedUpdate("v0.3.0")
+	if skipped {
+		t.Fatal("expired failed update should not be skipped")
+	}
+}
+
 func TestUpdateNoticeLinesUseReleaseNotes(t *testing.T) {
 	notice := updateNotice{
 		Kind:          updateNoticeUpdated,
@@ -71,6 +166,30 @@ func TestUpdateNoticeLinesUseReleaseNotes(t *testing.T) {
 	}
 	if strings.Contains(joined, "## Changes") {
 		t.Fatalf("included markdown heading: %q", joined)
+	}
+}
+
+func TestUpdateNoticeLinesShowDaemonRestartResult(t *testing.T) {
+	notice := updateNotice{
+		Kind:            updateNoticeUpdated,
+		LatestVersion:   "v0.3.0",
+		DaemonRestarted: true,
+	}
+	lines := updateNoticeLines(notice, 80, 3)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "Daemon restarted.") {
+		t.Fatalf("missing daemon restart status: %q", joined)
+	}
+
+	notice = updateNotice{
+		Kind:               updateNoticeUpdated,
+		LatestVersion:      "v0.3.0",
+		DaemonRestartError: "restart failed",
+	}
+	lines = updateNoticeLines(notice, 80, 3)
+	joined = strings.Join(lines, "\n")
+	if !strings.Contains(joined, "Daemon restart: restart failed") {
+		t.Fatalf("missing daemon restart error: %q", joined)
 	}
 }
 
